@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tool-Edit Review Phim Studio</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <!-- TOP BAR -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span>Tool-Edit Review Phim Studio</span>
+    </div>
+
+    <div id="hw-badge" class="hw-badge" title="Bấm để xem chi tiết cấu hình phần cứng">
+      <span id="hw-text">Đang dò phần cứng GPU...</span>
+      <span id="hw-enc-pill" class="pill-enc">AUTO</span>
+    </div>
+
+    <div class="topbar-right">
+      <div class="preset-bar">
+        <span style="font-size:11px;color:var(--text-2);">Preset Kênh:</span>
+        <select id="preset-select"></select>
+        <button id="btn-apply-preset" class="btn btn-sm" title="Áp dụng preset này cho video đang chọn">Áp dụng</button>
+        <button id="btn-save-preset" class="btn btn-sm btn-primary" title="Lưu cấu hình hiện tại thành Preset kênh">Lưu Preset</button>
+      </div>
+      <button id="btn-run-batch-az" class="btn btn-sm btn-success" title="Chạy Dịch SRT → Tạo Voice → Xuất Video song song cho TẤT CẢ video trong danh sách">🚀 Chạy A–Z Hàng Loạt</button>
+      <button id="btn-open-output" class="btn btn-sm">Thư mục Xuất</button>
+    </div>
+  </header>
+
+  <!-- MAIN WORKSPACE -->
+  <main class="workspace">
+    <!-- LEFT: VIDEO LIST -->
+    <aside class="sidebar">
+      <div class="panel-header" style="flex-direction:column;align-items:stretch;gap:8px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;">
+          <span>Danh sách Video (<span id="video-count">0</span>)</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+          <button id="btn-add-videos" class="btn btn-sm btn-primary">+ Thêm File</button>
+          <button id="btn-open-dl-modal" class="btn btn-sm btn-success">⬇ Link YT/Bili</button>
+        </div>
+      </div>
+      <div id="batch-banner" class="hint-box hidden" style="margin:8px 10px 0;font-size:11px;"></div>
+      <div id="video-list" class="video-list"></div>
+    </aside>
+
+    <!-- CENTER: PREVIEW STAGE -->
+    <section class="stage-col">
+      <div class="stage-toolbar">
+        <div class="layer-chips">
+          <span style="font-size:11.5px;color:var(--text-2);margin-right:4px;">Lớp chỉnh sửa:</span>
+          <button class="chip active" data-layer="subtitle">Phụ đề</button>
+          <button class="chip" data-layer="logo">Logo kênh</button>
+          <button class="chip" data-layer="greenscreen">Like/Sub nền xanh</button>
+          <button class="chip" data-layer="subremoval">Xóa sub / Mờ</button>
+        </div>
+        <div id="stage-meta" style="font-size:11.5px;color:var(--text-2);">Chưa chọn video</div>
+      </div>
+
+      <div id="stage-viewport" class="stage-viewport">
+        <div id="empty-stage" class="empty-stage">
+          <h3>Chưa có video nào được chọn</h3>
+          <p style="font-size:13px;line-height:1.5;margin-bottom:14px;">
+            Bấm <b>+ Thêm File</b> để chọn video từ máy hoặc <b>⬇ Link YT/Bili</b> để tải siêu tốc video + phụ đề gốc YouTube / BiliBili.
+          </p>
+          <div style="display:flex;gap:8px;justify-content:center;">
+            <button id="btn-add-videos-hero" class="btn btn-primary">+ Chọn Video từ máy</button>
+            <button id="btn-open-dl-hero" class="btn btn-success">⬇ Tải từ YouTube / BiliBili</button>
+          </div>
+        </div>
+
+        <div id="video-canvas-wrap" class="video-canvas-wrap hidden">
+          <video id="preview-video" playsinline preload="metadata"></video>
+
+          <!-- Overlay 1: Blur / AI Sub Removal ROI -->
+          <div id="ov-subremoval" class="ov-box hidden" data-layer="subremoval">
+            <span class="ov-label">Vùng Làm Mờ / Xóa Sub</span>
+            <div class="handle nw" data-dir="nw"></div><div class="handle n" data-dir="n"></div><div class="handle ne" data-dir="ne"></div>
+            <div class="handle w" data-dir="w"></div><div class="handle e" data-dir="e"></div>
+            <div class="handle sw" data-dir="sw"></div><div class="handle s" data-dir="s"></div><div class="handle se" data-dir="se"></div>
+          </div>
+
+          <!-- Overlay 2: Subtitle Box (Independent WxH + Rounded Corners) -->
+          <div id="ov-subtitle" class="ov-box selected" data-layer="subtitle">
+            <span class="ov-label">Khung Phụ Đề (kéo W×H tự do)</span>
+            <div id="ov-subtitle-inner"></div>
+            <div class="handle nw" data-dir="nw"></div><div class="handle n" data-dir="n"></div><div class="handle ne" data-dir="ne"></div>
+            <div class="handle w" data-dir="w"></div><div class="handle e" data-dir="e"></div>
+            <div class="handle sw" data-dir="sw"></div><div class="handle s" data-dir="s"></div><div class="handle se" data-dir="se"></div>
+          </div>
+
+          <!-- Overlay 3: Logo -->
+          <div id="ov-logo" class="ov-box hidden" data-layer="logo">
+            <span class="ov-label">Logo Kênh</span>
+            <img id="ov-logo-img" alt="Logo" />
+            <div class="handle nw" data-dir="nw"></div><div class="handle n" data-dir="n"></div><div class="handle ne" data-dir="ne"></div>
+            <div class="handle w" data-dir="w"></div><div class="handle e" data-dir="e"></div>
+            <div class="handle sw" data-dir="sw"></div><div class="handle s" data-dir="s"></div><div class="handle se" data-dir="se"></div>
+          </div>
+
+          <!-- Overlay 4: Green Screen CTA -->
+          <div id="ov-greenscreen" class="ov-box hidden" data-layer="greenscreen">
+            <span class="ov-label">Video Nền Xanh (kéo W×H tự do)</span>
+            <canvas id="ov-gs-canvas"></canvas>
+            <video id="gs-source-video" class="hidden" muted playsinline></video>
+            <div class="handle nw" data-dir="nw"></div><div class="handle n" data-dir="n"></div><div class="handle ne" data-dir="ne"></div>
+            <div class="handle w" data-dir="w"></div><div class="handle e" data-dir="e"></div>
+            <div class="handle sw" data-dir="sw"></div><div class="handle s" data-dir="s"></div><div class="handle se" data-dir="se"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TRANSPORT & RENDER STATUS -->
+      <div class="transport">
+        <div class="transport-row">
+          <button id="btn-play" class="btn btn-sm" style="min-width:74px;">▶ Phát</button>
+          <input id="seek-bar" type="range" min="0" max="100" step="0.05" value="0" />
+          <span id="timecode" class="timecode">00:00.0 / 00:00.0</span>
+        </div>
+        <div class="render-status-bar">
+          <span id="render-status-text">Sẵn sàng. Kéo thả trực tiếp các khung trên video để căn chỉnh.</span>
+          <span id="render-pct" style="font-weight:700;color:#34d399;"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT: INSPECTOR PANEL -->
+    <aside class="inspector">
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="preview">1. Cấu hình</button>
+        <button class="tab-btn" data-tab="translate">2. Dịch SRT</button>
+        <button class="tab-btn" data-tab="voice">3. Voice AI</button>
+      </div>
+
+      <div class="inspector-body">
+        <!-- TAB 1: PREVIEW & RENDER CONFIG -->
+        <div id="tab-preview" class="tab-pane">
+          <!-- SRT FILE -->
+          <div class="card">
+            <div class="card-head">
+              <span>Phụ đề (Subtitle)</span>
+              <label style="display:flex;align-items:center;gap:5px;font-size:11.5px;cursor:pointer;">
+                <input id="sub-enabled" type="checkbox" checked /> Bật phụ đề
+              </label>
+            </div>
+            <div class="field">
+              <label>File SRT (ưu tiên sub đã dịch)</label>
+              <div class="input-pick">
+                <input id="proj-srt-path" type="text" placeholder="Chưa chọn file .srt..." />
+                <button id="btn-pick-srt" class="btn btn-sm">Chọn</button>
+              </div>
+            </div>
+            <div class="field">
+              <label>Font chữ (300+ font hệ thống hoặc .ttf/.otf)</label>
+              <div class="input-pick">
+                <select id="sub-font-select"></select>
+                <button id="btn-pick-font" class="btn btn-sm" title="Chọn file font .ttf/.otf ngoài">...</button>
+              </div>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Cỡ chữ <span id="val-sub-size">42px</span></label>
+                <input id="sub-size" type="range" min="16" max="120" value="42" />
+              </div>
+              <div class="field">
+                <label>Viền chữ <span id="val-sub-outline">2px</span></label>
+                <input id="sub-outline" type="range" min="0" max="10" value="2" />
+              </div>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Màu chữ</label>
+                <input id="sub-color" type="color" value="#ffffff" />
+              </div>
+              <div class="field">
+                <label>Màu viền</label>
+                <input id="sub-outline-color" type="color" value="#000000" />
+              </div>
+            </div>
+            <div class="row-2" style="align-items:center;margin-bottom:8px;">
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                <input id="sub-bg-enabled" type="checkbox" checked /> Nền khung phụ đề
+              </label>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+                <input id="sub-bold" type="checkbox" checked /> Chữ đậm (Bold)
+              </label>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Màu nền (Background)</label>
+                <input id="sub-bg-color" type="color" value="#000000" />
+              </div>
+              <div class="field">
+                <label>Độ mờ nền <span id="val-sub-bg-op">72%</span></label>
+                <input id="sub-bg-opacity" type="range" min="0" max="1" step="0.02" value="0.72" />
+              </div>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Bo góc khung <span id="val-sub-radius">16px</span></label>
+                <input id="sub-radius" type="range" min="0" max="60" value="16" />
+              </div>
+              <div class="field">
+                <label>Căn lề ngang</label>
+                <select id="sub-align">
+                  <option value="center">Giữa</option>
+                  <option value="left">Trái</option>
+                  <option value="right">Phải</option>
+                </select>
+              </div>
+            </div>
+            <div class="field">
+              <label>Tọa độ khung phụ đề (% - kéo W×H độc lập)</label>
+              <div class="row-4">
+                <input id="sub-x" type="number" step="0.01" min="0" max="1" title="X" />
+                <input id="sub-y" type="number" step="0.01" min="0" max="1" title="Y" />
+                <input id="sub-w" type="number" step="0.01" min="0.05" max="1" title="Rộng (W)" />
+                <input id="sub-h" type="number" step="0.01" min="0.04" max="1" title="Cao (H)" />
+              </div>
+            </div>
+          </div>
+
+          <!-- BACKGROUND MUSIC (BGM CROSSFADE PLAYLIST) -->
+          <div class="card">
+            <div class="card-head">
+              <span>🎵 Nhạc Nền (Nối chéo Crossfade)</span>
+              <label style="display:flex;align-items:center;gap:5px;font-size:11.5px;cursor:pointer;">
+                <input id="bgm-enabled" type="checkbox" /> Bật Nhạc Nền
+              </label>
+            </div>
+            <div style="display:flex;gap:6px;margin-bottom:6px;">
+              <button id="btn-pick-bgm-files" class="btn btn-sm" style="flex:1;">+ Chọn File Nhạc</button>
+              <button id="btn-pick-bgm-folder" class="btn btn-sm">Thư mục</button>
+              <button id="btn-clear-bgm" class="btn btn-sm btn-danger" title="Xóa toàn bộ list nhạc">Xóa</button>
+            </div>
+            <div id="bgm-list" class="bgm-list"></div>
+            <div class="row-2">
+              <div class="field">
+                <label>Âm lượng nhạc <span id="val-bgm-vol">22%</span></label>
+                <input id="bgm-volume" type="range" min="0" max="1" step="0.02" value="0.22" />
+              </div>
+              <div class="field">
+                <label>Chồng đầu-đít <span id="val-bgm-xfade">3.5s</span></label>
+                <input id="bgm-crossfade" type="range" min="0.5" max="12" step="0.5" value="3.5" />
+              </div>
+            </div>
+            <label style="display:flex;align-items:center;gap:6px;font-size:11.5px;cursor:pointer;">
+              <input id="bgm-ducking" type="checkbox" checked /> Auto-Ducking (tự nhỏ nhạc khi Voice đọc)
+            </label>
+            <div style="font-size:10.5px;color:var(--text-2);margin-top:5px;">
+              1 bài tự lặp nối chéo mượt; nhiều bài sẽ nối chồng fade-out/fade-in lần lượt hết list rồi lặp lại.
+            </div>
+          </div>
+
+          <!-- LOGO -->
+          <div class="card">
+            <div class="card-head">
+              <span>Logo Kênh</span>
+              <label style="display:flex;align-items:center;gap:5px;font-size:11.5px;cursor:pointer;">
+                <input id="logo-enabled" type="checkbox" /> Bật Logo
+              </label>
+            </div>
+            <div class="field">
+              <label>File Logo hiện tại</label>
+              <div class="input-pick">
+                <input id="logo-file-path" type="text" placeholder="Chọn file ảnh logo..." />
+                <button id="btn-pick-logo" class="btn btn-sm">File</button>
+              </div>
+            </div>
+            <div class="field">
+              <label>Hoặc Thư mục chứa Logo các kênh</label>
+              <div class="input-pick">
+                <input id="logo-folder-path" type="text" placeholder="Chọn thư mục logo..." />
+                <button id="btn-pick-logo-folder" class="btn btn-sm">Thư mục</button>
+              </div>
+              <div id="logo-folder-grid" class="logo-grid hidden"></div>
+            </div>
+            <div class="field">
+              <label>Độ hiển thị (Opacity) <span id="val-logo-op">95%</span></label>
+              <input id="logo-opacity" type="range" min="0.1" max="1" step="0.05" value="0.95" />
+            </div>
+          </div>
+
+          <!-- GREEN SCREEN CTA -->
+          <div class="card">
+            <div class="card-head">
+              <span>Video Nền Xanh (Like / Subscribe)</span>
+              <label style="display:flex;align-items:center;gap:5px;font-size:11.5px;cursor:pointer;">
+                <input id="gs-enabled" type="checkbox" /> Bật CTA
+              </label>
+            </div>
+            <div class="field">
+              <label>File Video nền xanh</label>
+              <div class="input-pick">
+                <input id="gs-file-path" type="text" placeholder="Chọn video like/sub nền xanh..." />
+                <button id="btn-pick-gs" class="btn btn-sm">Chọn</button>
+              </div>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Màu nền cần xóa</label>
+                <input id="gs-color" type="color" value="#00ff00" />
+              </div>
+              <div class="field">
+                <label>Bắt đầu lúc (giây)</label>
+                <input id="gs-start" type="number" min="0" step="0.5" value="0" />
+              </div>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Độ nhạy xóa <span id="val-gs-sim">0.28</span></label>
+                <input id="gs-sim" type="range" min="0.05" max="0.65" step="0.01" value="0.28" />
+              </div>
+              <div class="field">
+                <label>Mềm viền <span id="val-gs-blend">0.08</span></label>
+                <input id="gs-blend" type="range" min="0" max="0.35" step="0.01" value="0.08" />
+              </div>
+            </div>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;">
+              <input id="gs-loop" type="checkbox" /> Lặp lại suốt video
+            </label>
+          </div>
+
+          <!-- SUB REMOVAL / BLUR -->
+          <div class="card">
+            <div class="card-head">
+              <span>Xóa Sub Gốc / Làm Mờ</span>
+            </div>
+            <div class="field">
+              <label>Chế độ xử lý sub gốc</label>
+              <select id="sr-mode">
+                <option value="none">Không dùng</option>
+                <option value="blur">Làm mờ bằng khung (kéo W×H tự do — Siêu nhanh)</option>
+                <option value="ai_clean">Xóa sub sạch (OCR dò chữ + Tái tạo nền không mờ)</option>
+              </select>
+            </div>
+            <div id="sr-blur-opts" class="field hidden">
+              <label>Độ mờ khung <span id="val-sr-blur">24</span></label>
+              <input id="sr-blur-strength" type="range" min="4" max="60" value="24" />
+            </div>
+            <div id="sr-ai-opts" class="hidden">
+              <div class="field">
+                <label>Chế độ AI tái tạo nền</label>
+                <select id="sr-ai-engine">
+                  <option value="sttn">Temporal Propagation + Mask Sạch (Nhanh & Nét)</option>
+                  <option value="lama">LaMa ONNX (nếu có model data/models/lama_fp32.onnx)</option>
+                </select>
+              </div>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:6px;cursor:pointer;">
+                <input id="sr-auto-ocr" type="checkbox" checked /> Tự động dò chữ OCR (chỉ xóa frame có chữ)
+              </label>
+              <div class="field">
+                <label>Tần suất quét OCR</label>
+                <select id="sr-ocr-fps" title="Số lần quét chữ mỗi giây video. Ít hơn = quét nhanh hơn. Frame nằm giữa 2 lần quét dùng vùng chữ của cả 2 lần nên sub mới xuất hiện vẫn được xóa.">
+                  <option value="2">2 lần/giây (Nhanh nhất — khuyên dùng)</option>
+                  <option value="3">3 lần/giây (Cân bằng)</option>
+                  <option value="4">4 lần/giây (Kỹ)</option>
+                  <option value="6">6 lần/giây (Rất kỹ, chậm)</option>
+                </select>
+              </div>
+              <div class="hint-box">
+                Kéo khung xanh trên Preview để khoanh vùng chứa sub gốc. Các frame không có chữ sẽ giữ nguyên 100% pixel gốc!
+              </div>
+            </div>
+          </div>
+
+          <!-- AUDIO & ENCODER -->
+          <div class="card">
+            <div class="card-head">
+              <span>Chế độ Edit & Tối ưu Phần cứng</span>
+            </div>
+            <div class="field">
+              <label>Chế độ Thuyết minh / Lồng tiếng</label>
+              <select id="audio-edit-mode">
+                <option value="narration">Thuyết minh (Mượn khoảng nghỉ + Auto-Ducking nền)</option>
+                <option value="dubbing">Lồng tiếng (Ép chặt đúng khung thời gian + Tắt thoại gốc)</option>
+              </select>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Âm lượng gốc <span id="val-orig-vol">15%</span></label>
+                <input id="audio-orig-vol" type="range" min="0" max="2" step="0.05" value="0.15" />
+              </div>
+              <div class="field">
+                <label>Tua tối đa <span id="val-max-atempo">1.25x</span></label>
+                <input id="audio-max-atempo" type="range" min="1.05" max="1.8" step="0.05" value="1.25" />
+              </div>
+            </div>
+            <div class="row-2" style="margin-bottom:8px;">
+              <label style="display:flex;align-items:center;gap:5px;font-size:11.5px;cursor:pointer;">
+                <input id="audio-mute" type="checkbox" /> Tắt hẳn tiếng gốc
+              </label>
+              <label style="display:flex;align-items:center;gap:5px;font-size:11.5px;cursor:pointer;">
+                <input id="audio-ducking" type="checkbox" checked /> Auto-Ducking
+              </label>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Encoder phần cứng</label>
+                <select id="cfg-encoder">
+                  <option value="auto">Tự động (Khuyên dùng)</option>
+                  <option value="h264_qsv">Intel GPU (h264_qsv)</option>
+                  <option value="h264_nvenc">NVIDIA (h264_nvenc)</option>
+                  <option value="libx264">CPU (libx264)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Hiệu năng máy</label>
+                <select id="cfg-perf">
+                  <option value="auto">Tự động theo máy</option>
+                  <option value="balanced">Balanced (Laptop)</option>
+                  <option value="dual_gpu_max">Dual-GPU Max</option>
+                  <option value="workstation">Workstation (RTX)</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 2: TRANSLATE & CLEAN SRT (ANTIGRAVITY) -->
+        <div id="tab-translate" class="tab-pane hidden">
+          <div class="card">
+            <div class="card-head">
+              <span>Dịch SRT bằng Antigravity</span>
+              <span id="tr-backend-tag" class="tag ok">SDK Sẵn sàng</span>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Ngôn ngữ gốc</label>
+                <select id="tr-src-lang"></select>
+              </div>
+              <div class="field">
+                <label>Ngôn ngữ dịch</label>
+                <select id="tr-tgt-lang"></select>
+              </div>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Nền tảng</label>
+                <select id="tr-provider">
+                  <option value="antigravity">Antigravity (SDK / CLI)</option>
+                  <option value="gemini_api">Gemini API Trực tiếp</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Cấp độ tư duy</label>
+                <select id="tr-thinking">
+                  <option value="minimal">Minimal (Rất nhanh)</option>
+                  <option value="low">Low (Nhanh)</option>
+                  <option value="medium">Medium (Cân bằng)</option>
+                  <option value="high" selected>High (Sâu)</option>
+                  <option value="xhigh">Extra High (Tối đa)</option>
+                </select>
+              </div>
+            </div>
+            <div class="field">
+              <label>Model Antigravity (Mới nhất)</label>
+              <select id="tr-model"></select>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Số dòng mỗi lô (Batch)</label>
+                <input id="tr-batch" type="number" min="10" max="120" value="45" />
+              </div>
+              <div class="field">
+                <label>Độ chênh độ dài (%)</label>
+                <input id="tr-tol" type="number" min="5" max="50" value="15" />
+              </div>
+            </div>
+            <div class="field">
+              <label>Số luồng dịch song song (1–16)</label>
+              <input id="tr-concurrency" type="number" min="1" max="16" value="4" title="Số lô SRT gửi dịch cùng lúc. Nhiều luồng = nhanh hơn, nhưng dễ bị giới hạn tốc độ (rate limit). Khuyên dùng 3–6." />
+            </div>
+            <div class="field">
+              <label>API Key (tùy chọn nếu Antigravity cần key ngoài)</label>
+              <input id="tr-api-key" type="password" placeholder="Để trống nếu đã đăng nhập Antigravity/ENV..." />
+            </div>
+            <div class="row-2" style="margin-top:8px;">
+              <button id="btn-analyze-style" class="btn btn-sm">1. Phân tích Style Guide</button>
+              <button id="btn-translate-srt" class="btn btn-sm btn-primary">2. Dịch SRT (Lưu tiến trình)</button>
+            </div>
+            <div style="margin-top:6px;display:flex;justify-content:space-between;align-items:center;">
+              <span id="tr-checkpoint-info" style="font-size:11px;color:var(--text-2);">Checkpoint: Chưa dịch</span>
+              <button id="btn-translate-reset" class="btn btn-sm btn-danger" title="Xóa checkpoint cũ và dịch lại từ dòng 1">Dịch lại từ đầu</button>
+            </div>
+          </div>
+
+          <!-- SRT GARBAGE CLEANER CARD -->
+          <div class="card">
+            <div class="card-head">
+              <span>🧹 Dọn Rác SRT Gốc (Xóa spam / lỗi ASR)</span>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Model sửa SRT rác</label>
+                <select id="clean-srt-model"></select>
+              </div>
+              <div class="field">
+                <label>Tư duy dọn rác</label>
+                <select id="clean-srt-thinking">
+                  <option value="minimal">Minimal</option>
+                  <option value="low" selected>Low (Nhanh)</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                </select>
+              </div>
+            </div>
+            <div class="row-2">
+              <button id="btn-clean-srt-rules" class="btn btn-sm">Lọc nhanh (Không AI)</button>
+              <button id="btn-clean-srt-ai" class="btn btn-sm btn-primary">Dọn bằng Antigravity</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <span>File Style Guide (Topic / Context / Nhân vật)</span>
+              <button id="btn-save-style-guide" class="btn btn-sm">Lưu sửa</button>
+            </div>
+            <div class="field">
+              <textarea id="style-guide-editor" rows="7" placeholder="Chạy '1. Phân tích Style Guide' hoặc dán Style Guide tại đây..."></textarea>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><span>Skill Prompt từ gem.txt</span></div>
+            <div class="field">
+              <textarea id="gem-preview" rows="4" readonly style="font-family:Consolas,monospace;font-size:10.5px;"></textarea>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 3: VOICE AI -->
+        <div id="tab-voice" class="tab-pane hidden">
+          <div class="card">
+            <div class="card-head">
+              <span>Kho Giọng Đọc Miễn Phí (Đa Luồng)</span>
+              <span id="voice-count-tag" class="tag ok">Free</span>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Nguồn giọng</label>
+                <select id="voice-provider">
+                  <option value="capcut_tiktok">CapCut / TikTok (Free)</option>
+                  <option value="edge_tts">Edge-TTS Neural (318 + Multilingual)</option>
+                  <option value="gtts">Google TTS Free (Có Tagalog/PH)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Lọc Ngôn ngữ</label>
+                <select id="voice-lang"></select>
+              </div>
+            </div>
+            <label style="display:flex;align-items:center;gap:6px;font-size:11.5px;margin-bottom:8px;cursor:pointer;">
+              <input id="voice-include-multi" type="checkbox" checked /> ⭐ Hiện giọng nâng cấp Đa ngôn ngữ (Multilingual — như Clipchamp)
+            </label>
+            <div class="field">
+              <label>Chọn giọng đọc (<span id="voice-list-num">0</span> giọng)</label>
+              <select id="voice-select" size="7" style="height:155px;"></select>
+            </div>
+            <div id="voice-empty-notice" class="hint-box hidden" style="margin-bottom:8px;">
+              Nguồn CapCut/TikTok công khai chưa mở voice ID riêng cho ngôn ngữ này. Bấm nút dưới để chuyển sang <b>Edge-TTS (có giọng bản địa + 10 giọng nâng cấp Multilingual)</b> hoặc <b>Google TTS Free</b>!
+              <div style="margin-top:6px;display:flex;gap:6px;">
+                <button id="btn-switch-edge" class="btn btn-sm btn-primary">Dùng Edge-TTS</button>
+                <button id="btn-switch-gtts" class="btn btn-sm">Dùng Google TTS</button>
+              </div>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Tốc độ đọc <span id="val-voice-speed">1.00x</span></label>
+                <input id="voice-speed" type="range" min="0.7" max="1.5" step="0.05" value="1.0" />
+              </div>
+              <div class="field">
+                <label>⚡ Số luồng song song <span id="val-voice-conc">12 luồng</span></label>
+                <input id="voice-concurrency" type="range" min="1" max="32" step="1" value="12" />
+              </div>
+            </div>
+            <div class="field">
+              <label>TikTok Session ID (tùy chọn để gọi trực tiếp ByteDance)</label>
+              <input id="voice-tiktok-sid" type="password" placeholder="Không bắt buộc (để trống dùng relay tự động)" />
+            </div>
+            <label style="display:flex;align-items:center;gap:6px;font-size:11.5px;margin-bottom:10px;cursor:pointer;">
+              <input id="voice-fallback-edge" type="checkbox" checked /> Tự động dự phòng Edge-TTS nếu TikTok quá tải
+            </label>
+            <div class="row-2">
+              <button id="btn-preview-voice" class="btn btn-sm">🔊 Nghe thử giọng</button>
+              <button id="btn-generate-voices" class="btn btn-sm btn-primary">🎙 Tạo Voice cho SRT</button>
+            </div>
+            <audio id="voice-audition-player" controls class="hidden" style="width:100%;height:34px;margin-top:8px;"></audio>
+          </div>
+        </div>
+      </div>
+
+      <!-- FOOTER RENDER BUTTONS -->
+      <div class="inspector-footer">
+        <div class="footer-btns">
+          <button id="btn-render-sample" class="btn">⚡ Xuất thử 8s</button>
+          <button id="btn-render-full" class="btn btn-primary">🎬 Xuất Video Full</button>
+        </div>
+        <button id="btn-run-one-az" class="btn btn-success" style="width:100%;">🚀 Chạy Trọn Gói A–Z Video Này (Dịch → Voice → Xuất)</button>
+        <button id="btn-stop-job" class="btn btn-danger hidden" style="width:100%;margin-top:6px;" title="Dừng ngay tiến trình đang chạy (dịch / voice / xuất video)">⏹ Dừng Tiến Trình</button>
+      </div>
+    </aside>
+  </main>
+
+  <!-- MODAL: DOWNLOAD YOUTUBE / BILIBILI MULTI-THREADED -->
+  <div id="dl-modal" class="modal-backdrop hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <span>⬇ Tải Video + Phụ Đề Siêu Tốc (YouTube / BiliBili)</span>
+        <button id="btn-close-dl-modal" class="btn btn-sm">✕</button>
+      </div>
+      <div class="field">
+        <label>Link Video YouTube hoặc BiliBili</label>
+        <input id="dl-url" type="text" placeholder="https://www.youtube.com/watch?v=... hoặc https://www.bilibili.com/video/BV..." />
+      </div>
+      <div class="field">
+        <label>Đặt tên file Video (để trống sẽ lấy tên gốc)</label>
+        <input id="dl-name" type="text" placeholder="Ví dụ: Review_Phim_Tap_1" />
+      </div>
+      <div class="row-2">
+        <div class="field">
+          <label>Ưu tiên phụ đề gốc ngôn ngữ</label>
+          <select id="dl-sub-lang">
+            <option value="auto">Tự động (Ưu tiên sub có sẵn)</option>
+            <option value="zh">Tiếng Trung (zh / zh-Hans)</option>
+            <option value="vi">Tiếng Việt (vi)</option>
+            <option value="en">Tiếng Anh (en)</option>
+            <option value="fil">Tiếng Philippines (fil / tl)</option>
+            <option value="ja">Tiếng Nhật (ja)</option>
+            <option value="ko">Tiếng Hàn (ko)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>⚡ Số luồng tải song song (aria2c)</label>
+          <select id="dl-threads">
+            <option value="8">8 luồng</option>
+            <option value="16" selected>16 luồng (Siêu nhanh — Khuyên dùng)</option>
+            <option value="24">24 luồng</option>
+            <option value="32">32 luồng (Tối đa)</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label>Cookie trình duyệt (cần cho BiliBili 1080p+ / sub CC đăng nhập)</label>
+        <select id="dl-cookies">
+          <option value="none">Không dùng Cookie</option>
+          <option value="edge">Lấy từ Microsoft Edge</option>
+          <option value="chrome">Lấy từ Google Chrome</option>
+        </select>
+      </div>
+      <div class="card" style="margin:10px 0;">
+        <div class="card-head" style="margin-bottom:6px;"><span>🧹 Tự động sửa & dọn rác SRT sau khi tải</span></div>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:6px;cursor:pointer;">
+          <input id="dl-clean-rules" type="checkbox" checked /> Lọc rác nhanh (thẻ HTML, dòng lặp YouTube, [Nhạc], link)
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:8px;cursor:pointer;">
+          <input id="dl-clean-ai" type="checkbox" /> Gửi vào Antigravity AI xóa dòng spam/rác & sửa lỗi ASR
+        </label>
+        <div id="dl-ai-opts" class="row-2 hidden">
+          <div class="field">
+            <label>Model sửa SRT rác</label>
+            <select id="dl-clean-model"></select>
+          </div>
+          <div class="field">
+            <label>Cấp độ tư duy</label>
+            <select id="dl-clean-thinking">
+              <option value="minimal">Minimal</option>
+              <option value="low" selected>Low (Nhanh)</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      <div id="dl-status-box" class="hint-box hidden" style="margin-bottom:10px;"></div>
+      <div style="display:flex;justify-content:flex-end;gap:8px;">
+        <button id="btn-cancel-dl" class="btn">Đóng</button>
+        <button id="btn-start-dl" class="btn btn-success">⚡ Tải Video & Sub Ngay</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

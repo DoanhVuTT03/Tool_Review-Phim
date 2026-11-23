@@ -1,0 +1,27 @@
+# Python / virtualenv
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Binaries (ffmpeg/ffprobe > 100 MB, GitHub limit) - see README for download links
+bin/*
+!bin/.gitkeep
+
+# User data: videos, projects (may contain API keys / TikTok sessionid), outputs, cache, logs, models
+data/*
+!data/presets/
+data/presets/*
+!data/presets/default_review.json
+downloads/
+
+# Editor / OS / tooling
+.claude/
+.vscode/
+.idea/
+*.lnk
+Thumbs.db
+desktop.ini
+*.log

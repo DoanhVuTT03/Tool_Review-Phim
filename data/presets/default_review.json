@@ -1,0 +1,98 @@
+{
+  "id": "default_review",
+  "name": "Kênh Review Mặc Định (Thuyết minh)",
+  "config": {
+    "subtitle": {
+      "enabled": true,
+      "box": {
+        "x": 0.08,
+        "y": 0.78,
+        "w": 0.84,
+        "h": 0.14
+      },
+      "font_family": "Arial",
+      "font_path": "",
+      "font_size": 42,
+      "bold": true,
+      "text_color": "#FFFFFF",
+      "outline_color": "#000000",
+      "outline_width": 2,
+      "bg_enabled": true,
+      "bg_color": "#000000",
+      "bg_opacity": 0.72,
+      "border_radius": 16,
+      "padding_x": 20,
+      "padding_y": 12,
+      "align": "center",
+      "valign": "middle",
+      "line_spacing": 1.2,
+      "sample_text": "Đây là dòng phụ đề xem trước (kéo khung để chỉnh dài/rộng)"
+    },
+    "logo": {
+      "enabled": false,
+      "file_path": "",
+      "folder_path": "",
+      "box": {
+        "x": 0.82,
+        "y": 0.04,
+        "w": 0.14,
+        "h": 0.12
+      },
+      "opacity": 0.95
+    },
+    "green_screen": {
+      "enabled": false,
+      "file_path": "",
+      "box": {
+        "x": 0.65,
+        "y": 0.68,
+        "w": 0.3,
+        "h": 0.22
+      },
+      "chroma_color": "#00FF00",
+      "similarity": 0.28,
+      "blend": 0.08,
+      "start_sec": 0.0,
+      "loop_enabled": false,
+      "mute_cta_audio": true
+    },
+    "sub_removal": {
+      "mode": "none",
+      "box": {
+        "x": 0.12,
+        "y": 0.84,
+        "w": 0.76,
+        "h": 0.12
+      },
+      "blur_strength": 24,
+      "ai_engine": "sttn",
+      "auto_detect_ocr": true
+    },
+    "audio": {
+      "edit_mode": "narration",
+      "original_volume": 0.15,
+      "mute_original": false,
+      "auto_ducking": true,
+      "duck_level": 0.12,
+      "max_atempo": 1.25
+    },
+    "translate": {
+      "source_lang": "zh",
+      "target_lang": "vi",
+      "provider": "antigravity",
+      "model": "gemini-2.5-pro",
+      "thinking_level": "medium",
+      "batch_size": 45,
+      "length_tolerance_pct": 15
+    },
+    "voice": {
+      "provider": "capcut_tiktok",
+      "language": "vi",
+      "voice_id": "",
+      "voice_name": "",
+      "speed": 1.0
+    },
+    "performance_profile": "auto",
+    "encoder_override": "auto"
+  }
+}
