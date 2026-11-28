@@ -31,6 +31,9 @@ CAPCUT_TIKTOK_FREE_VOICES: List[Dict[str, Any]] = [
     # Vietnamese
     {"id": "BV074_streaming", "name": "CapCut VN - Cô Gái Hoạt Bát (Nữ)", "lang": "vi", "gender": "Female", "style": "Review / Sôi nổi", "free": True, "provider": "capcut_tiktok"},
     {"id": "BV075_streaming", "name": "CapCut VN - Thanh Niên Tự Tin (Nam)", "lang": "vi", "gender": "Male", "style": "Review / Thuyết minh", "free": True, "provider": "capcut_tiktok"},
+    # Volcengine (CapCut's voice library) multilingual voice 天才少女: cn/en/ja/pt/es/id/vi/th - verified via relay.
+    # (Volcengine has NO Filipino/Tagalog voice: for Filipino use Edge-TTS fil-PH-AngeloNeural / BlessicaNeural.)
+    {"id": "BV421_streaming", "name": "CapCut Đa ngữ - Thiên Tài Thiếu Nữ (Nữ)", "lang": "vi", "gender": "Female", "style": "Đa ngôn ngữ / Trẻ trung", "free": True, "provider": "capcut_tiktok"},
     # English US / UK / AU
     {"id": "en_us_001", "name": "TikTok US - Jessie (Female)", "lang": "en", "gender": "Female", "style": "Viral / Clear", "free": True, "provider": "capcut_tiktok"},
     {"id": "en_us_002", "name": "TikTok US - Female 2", "lang": "en", "gender": "Female", "style": "Natural", "free": True, "provider": "capcut_tiktok"},
@@ -54,6 +57,8 @@ CAPCUT_TIKTOK_FREE_VOICES: List[Dict[str, Any]] = [
     {"id": "BV002_streaming", "name": "CapCut ZH - 通用男声 (Nam Chuẩn)", "lang": "zh", "gender": "Male", "style": "Standard", "free": True, "provider": "capcut_tiktok"},
     {"id": "BV700_streaming", "name": "CapCut ZH - 灿灿 (Nữ Giải Thích Phim)", "lang": "zh", "gender": "Female", "style": "Movie Recap", "free": True, "provider": "capcut_tiktok"},
     {"id": "BV701_streaming", "name": "CapCut ZH - 擎苍 (Nam Thuyết Minh)", "lang": "zh", "gender": "Male", "style": "Movie Recap", "free": True, "provider": "capcut_tiktok"},
+    {"id": "BV411_streaming", "name": "CapCut ZH - 影视解说小帅 (Nam Thuyết Minh Phim)", "lang": "zh", "gender": "Male", "style": "Movie Recap", "free": True, "provider": "capcut_tiktok"},
+    {"id": "BV421_streaming", "name": "CapCut ZH - 天才少女 (Nữ Đa ngữ)", "lang": "zh", "gender": "Female", "style": "Đa ngôn ngữ", "free": True, "provider": "capcut_tiktok"},
     {"id": "BV005_streaming", "name": "CapCut ZH - 活泼女声 (Nữ Hoạt Bát)", "lang": "zh", "gender": "Female", "style": "Lively", "free": True, "provider": "capcut_tiktok"},
     # Japanese
     {"id": "jp_001", "name": "TikTok JP - Miho (Female)", "lang": "ja", "gender": "Female", "style": "Standard", "free": True, "provider": "capcut_tiktok"},
@@ -407,11 +412,10 @@ async def synthesize_line(
                 "Hãy nhập TikTok sessionid hoặc bật tự động dự phòng Edge-TTS."
             )
 
-    edge_vid = (
-        _resolve_edge_fallback_voice(cfg)
-        if cfg.provider == "capcut_tiktok"
-        else (cfg.voice_id or _resolve_edge_fallback_voice(cfg))
-    )
+    # _resolve_edge_fallback_voice keeps a real Edge voice ("...Neural") and maps anything else (a CapCut id left
+    # over after switching the voice source to Edge-TTS) to a matching Edge voice. Sending "BV074_streaming" to
+    # Edge made "Nghe thử giọng" fail with HTTP 500.
+    edge_vid = _resolve_edge_fallback_voice(cfg)
     audio_bytes = await _call_edge_tts(clean_text, edge_vid, cfg.speed)
     return audio_bytes, f"edge_tts:{edge_vid}"
 
@@ -421,13 +425,55 @@ def _cache_key(text: str, cfg: VoiceConfig) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
 
 
+# Max parallel requests per voice source. Edge-TTS (Microsoft) handles hundreds of parallel requests, so the
+# user's number is used as is. The free CapCut/TikTok relays and Google gTTS rate-limit / block quickly.
+_MAX_WORKERS = {"edge_tts": 500, "capcut_tiktok": 32, "gtts": 16}
+
+
+def effective_tts_workers(cfg: VoiceConfig, requested: Optional[int] = None) -> int:
+    n = int(requested or cfg.concurrency or 12)
+    return max(1, min(_MAX_WORKERS.get(cfg.provider, 32), n))
+
+
 async def generate_project_voices(
     project: VideoProject,
     concurrency: Optional[int] = None,
     on_progress: Optional[ProgressCallback] = None,
 ) -> Path:
-    """High-throughput parallel TTS synthesis with configurable worker count (1-32 threads),
-    live speed/ETA telemetry, and persistent disk cache."""
+    """Voice for every line. Higgs TTS 3 has its own flow (GPU server + Whisper review, higgs_voice.py).
+    Other voices: parallel requests, then (auto_fit) the lines whose real audio is longer than their time on
+    screen are rewritten shorter by the LLM and voiced again (only those lines: the rest comes from the cache)."""
+    if project.config.voice.provider == "higgs3":
+        from app.services.higgs_voice import generate_project_voices_higgs
+
+        return await generate_project_voices_higgs(project, on_progress)
+    path = await _generate_project_voices_core(project, concurrency, on_progress)
+    cfg = project.config.voice
+    if not (cfg.auto_fit and project.translated_srt_path and Path(project.translated_srt_path).exists()):
+        return path
+    from app.services.length_fit import fit_project_lines, measure_voice_lengths
+
+    items = json.loads(path.read_text(encoding="utf-8")).get("items", [])
+    measured = await asyncio.to_thread(measure_voice_lengths, items)
+    fit = await fit_project_lines(
+        project, measured=measured,
+        on_progress=(lambda p, m: on_progress(97.0, f"[Độ dài] {m}")) if on_progress else None,
+    )
+    if not fit["changed"]:
+        return path
+    if on_progress:
+        on_progress(97.5, f"Tạo lại voice cho {len(fit['changed'])} câu đã rút gọn...")
+    return await _generate_project_voices_core(project, concurrency, on_progress)
+
+
+async def _generate_project_voices_core(
+    project: VideoProject,
+    concurrency: Optional[int] = None,
+    on_progress: Optional[ProgressCallback] = None,
+) -> Path:
+    """High-throughput parallel TTS synthesis (Edge-TTS: up to 500 parallel requests), live speed/ETA
+    telemetry, persistent disk cache. A failing line no longer aborts the whole job: failed lines are retried
+    at the end with fewer parallel requests, and only lines that still fail are reported."""
     srt_file = project.translated_srt_path or project.srt_path
     if not srt_file or not Path(srt_file).exists():
         raise RuntimeError("Chưa có file SRT (gốc hoặc đã dịch) để tạo voice.")
@@ -437,7 +483,7 @@ async def generate_project_voices(
         raise RuntimeError("File SRT không có dòng phụ đề nào.")
 
     cfg = project.config.voice
-    workers = max(1, min(32, int(concurrency or cfg.concurrency or 12)))
+    workers = effective_tts_workers(cfg, concurrency)
     voice_dir = PROJECTS_DIR / project.id / "voice_cache"
     voice_dir.mkdir(parents=True, exist_ok=True)
 
@@ -453,18 +499,28 @@ async def generate_project_voices(
             f"Đang tạo voice song song ({workers} luồng) cho {total} câu ({cfg.voice_name or cfg.voice_id})...",
         )
 
+    failed: Dict[int, str] = {}
     limits = httpx.Limits(max_connections=workers + 4, max_keepalive_connections=workers)
     async with httpx.AsyncClient(follow_redirects=True, limits=limits) as http_client:
-        async def _worker(cue: SubtitleCue):
+        async def _worker(cue: SubtitleCue, gate: asyncio.Semaphore, count: bool = True):
             nonlocal done_count
             key = _cache_key(cue.text, cfg)
             out_mp3 = voice_dir / f"{key}.mp3"
             provider_used = "cache"
             if not out_mp3.exists() or out_mp3.stat().st_size < 200:
-                async with sem:
-                    audio_bytes, provider_used = await synthesize_line(cue.text, cfg, client=http_client)
-                    if audio_bytes:
-                        out_mp3.write_bytes(audio_bytes)
+                async with gate:
+                    try:
+                        audio_bytes, provider_used = await synthesize_line(cue.text, cfg, client=http_client)
+                        if audio_bytes:
+                            tmp = out_mp3.with_suffix(".part")
+                            tmp.write_bytes(audio_bytes)
+                            tmp.replace(out_mp3)  # never leave a half-written mp3 in the cache
+                        failed.pop(cue.index, None)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:  # noqa: BLE001  (one bad line must not abort 10 000 others)
+                        failed[cue.index] = str(e)[:160]
+                        provider_used = "failed"
             results[cue.index] = {
                 "index": cue.index,
                 "start_sec": cue.start_sec,
@@ -473,30 +529,50 @@ async def generate_project_voices(
                 "audio_path": str(out_mp3) if out_mp3.exists() else "",
                 "provider_used": provider_used,
             }
+            if not count:
+                return
             done_count += 1
             if on_progress and (done_count % 3 == 0 or done_count == total):
                 elapsed = max(0.1, time.perf_counter() - t_start)
                 rate = done_count / elapsed
                 eta = (total - done_count) / max(0.1, rate)
-                pct = round(5.0 + (done_count / total) * 95.0, 1)
+                pct = round(5.0 + (done_count / total) * 90.0, 1)
+                err = f" • {len(failed)} câu lỗi (sẽ thử lại)" if failed else ""
                 on_progress(
                     pct,
-                    f"Tạo voice ({workers} luồng): {done_count}/{total} câu ({rate:.1f} câu/s • Còn ~{eta:.0f}s)",
+                    f"Tạo voice ({workers} luồng): {done_count}/{total} câu ({rate:.1f} câu/s • Còn ~{eta:.0f}s){err}",
                 )
 
-        await asyncio.gather(*[_worker(c) for c in cues])
+        await asyncio.gather(*[_worker(c, sem) for c in cues])
+
+        # Retry the failed lines (usually rate limiting under many threads) with fewer parallel requests.
+        for attempt in range(2):
+            if not failed:
+                break
+            retry_cues = [c for c in cues if c.index in failed]
+            if on_progress:
+                on_progress(96.0, f"Thử lại {len(retry_cues)} câu lỗi (lần {attempt + 1}/2, ít luồng hơn)...")
+            await asyncio.sleep(2.0 * (attempt + 1))
+            gate = asyncio.Semaphore(max(1, min(8, workers // 4 or 1)))
+            await asyncio.gather(*[_worker(c, gate, count=False) for c in retry_cues])
 
     manifest = {
         "project_id": project.id,
         "srt_file": srt_file,
         "voice_config": cfg.model_dump(),
         "workers_used": workers,
+        "failed": {str(k): v for k, v in failed.items()},
         "items": [results[c.index] for c in cues if c.index in results],
     }
     manifest_path = voice_dir / "voice_manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    ok_lines = sum(1 for it in manifest["items"] if it.get("audio_path"))
+    if failed and ok_lines == 0:
+        sample = next(iter(failed.values()))
+        raise RuntimeError(f"Không tạo được câu voice nào ({len(failed)} câu lỗi). Lỗi đầu tiên: {sample}")
     if on_progress:
         total_sec = time.perf_counter() - t_start
-        on_progress(100.0, f"Xong {len(manifest['items'])} file voice trong {total_sec:.1f}s ({workers} luồng)!")
+        warn = f" ⚠ {len(failed)} câu vẫn lỗi sau 2 lần thử lại (sẽ im lặng ở đoạn đó)" if failed else ""
+        on_progress(100.0, f"Xong {ok_lines}/{total} câu voice trong {total_sec:.1f}s ({workers} luồng)!{warn}")
     return manifest_path

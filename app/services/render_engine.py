@@ -5,19 +5,24 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
 from app.config import OUTPUTS_DIR, TEMP_DIR, get_ffmpeg_path
 from app.models import EditConfig, SubtitleCue, VideoProject
 from app.services.cancel import check_cancel, register_proc, unregister_proc
+from app.services import timing
 from app.services.hardware import detect_hardware
 from app.services.media import parse_srt
-from app.services.sub_remover import AICleanStream
-from app.services.subtitle_renderer import build_subtitle_concat_sequence
+from app.services.sub_remover import ai_clean_boxes, make_clean_stream
+from app.services.subtitle_renderer import build_channel_text_sequence, build_subtitle_concat_sequence
 
 
 ProgressCallback = Callable[[float, str], None]
+
+# NVDEC -> CUDA overlays -> NVENC graph on NVIDIA (falls back to the CPU graph by itself). Switch for diagnostics.
+GPU_GRAPH_ENABLED = True
 
 
 def _pick_encoder(cfg: EditConfig) -> str:
@@ -28,12 +33,33 @@ def _pick_encoder(cfg: EditConfig) -> str:
     return hw["recommended_encoder"]
 
 
-def _encoder_args(encoder: str) -> List[str]:
+def _encoder_args(encoder: str, gpu_frames: bool = False) -> List[str]:
+    if encoder == "h264_nvenc" and gpu_frames:
+        # frames are already yuv420p in VRAM (CUDA graph): no -pix_fmt, NVENC reads them directly
+        return ["-c:v", "h264_nvenc", "-preset", "p2", "-rc", "vbr", "-cq", "22"]
     if encoder == "h264_nvenc":
-        return ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "22", "-pix_fmt", "yuv420p"]
+        # p2 vs p4 on RTX 3060 @1080p: 635 vs 387 fps, same SSIM at cq 22 (file ~10% larger). p4 capped the
+        # whole render (NVENC was the slowest stage once inpainting scaled with CPU threads).
+        return ["-c:v", "h264_nvenc", "-preset", "p2", "-rc", "vbr", "-cq", "22", "-pix_fmt", "yuv420p"]
     if encoder == "h264_qsv":
         return ["-c:v", "h264_qsv", "-preset", "faster", "-global_quality", "23", "-pix_fmt", "nv12"]
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p"]
+
+
+def _output_size_ok(path: Path, vw: int, vh: int) -> bool:
+    """The CUDA overlay graph must keep the source frame size (see the overlay_cuda note in the logo step)."""
+    from app.config import get_ffprobe_path
+
+    try:
+        res = subprocess.run(
+            [get_ffprobe_path(), "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+             "-of", "csv=p=0:s=x", str(path)],
+            capture_output=True, text=True, timeout=20, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        w, h = (int(x) for x in res.stdout.strip().split("x")[:2])
+        return (w, h) == (vw, vh)
+    except Exception:
+        return True  # cannot tell -> keep the result
 
 
 def _sanitize_hex(color: str) -> str:
@@ -89,6 +115,7 @@ def render_project_sync(
         on_progress(5.0, "Đang chuẩn bị tài nguyên & lớp phụ đề...")
 
     inputs: List[str] = ["-y", "-hide_banner", "-loglevel", "error", "-progress", "pipe:1"]
+    hwaccel_at = len(inputs)  # GPU graph: "-hwaccel cuda ..." goes right before the main input
     if preview_seconds and preview_seconds > 0:
         inputs.extend(["-t", f"{total_dur:.3f}"])
     inputs.extend(["-i", str(src_video)])
@@ -113,14 +140,16 @@ def render_project_sync(
                 )
             ]
         if cues:
-            concat_txt, sx, sy, _, _ = build_subtitle_concat_sequence(
-                cues=cues,
-                cfg=cfg.subtitle,
-                video_w=vw,
-                video_h=vh,
-                video_duration=total_dur,
-                work_dir=work_dir / "subs",
-            )
+            with timing.step(project.id, "subs", f"Tạo phụ đề PNG ({len(cues)} câu)"):
+                concat_txt, sx, sy, _, _ = build_subtitle_concat_sequence(
+                    cues=cues,
+                    cfg=cfg.subtitle,
+                    video_w=vw,
+                    video_h=vh,
+                    video_duration=total_dur,
+                    work_dir=work_dir / "subs",
+                    fps=float(project.fps or 30.0),
+                )
             inputs.extend(["-f", "concat", "-safe", "0", "-i", str(concat_txt)])
             sub_input_idx = next_input_idx
             sub_box_xy = (sx, sy)
@@ -128,9 +157,22 @@ def render_project_sync(
 
     # Logo input
     logo_input_idx: Optional[int] = None
+    logo_at = -1
     if cfg.logo.enabled and cfg.logo.file_path and Path(cfg.logo.file_path).exists():
+        logo_at = len(inputs)  # GPU graph inserts "-loop 1" here (see the logo overlay below)
         inputs.extend(["-i", cfg.logo.file_path])
         logo_input_idx = next_input_idx
+        next_input_idx += 1
+
+    # Channel name text (endless input: one looped PNG, or a looped concat of animation frames)
+    ch_input_idx: Optional[int] = None
+    ch_xy = (0, 0)
+    ch = cfg.channel_text
+    if ch.enabled and (ch.text or "").strip():
+        ch_args, chx, chy = build_channel_text_sequence(ch, vw, vh, float(project.fps or 30.0), work_dir / "channel")
+        inputs.extend(ch_args)
+        ch_input_idx = next_input_idx
+        ch_xy = (chx, chy)
         next_input_idx += 1
 
     # Green screen CTA input
@@ -146,7 +188,8 @@ def render_project_sync(
     voice_input_idx: Optional[int] = None
     if not voice_wav_path and cfg.bgm.enabled and cfg.bgm.file_paths:
         from app.services.audio_assembler import build_standalone_audio_mix_sync
-        bgm_mix = build_standalone_audio_mix_sync(project, total_dur)
+        with timing.step(project.id, "bgm", "Trộn nhạc nền"):
+            bgm_mix = build_standalone_audio_mix_sync(project, total_dur)
         if bgm_mix and bgm_mix.exists():
             voice_wav_path = str(bgm_mix)
             voice_already_mixed = True
@@ -156,93 +199,136 @@ def render_project_sync(
         voice_input_idx = next_input_idx
         next_input_idx += 1
 
-    # AI Clean Sub strips, produced by Python while this same ffmpeg encodes (one decode + one encode)
-    use_ai_clean = ai_clean and cfg.sub_removal.mode == "ai_clean" and not source_video_override
+    # AI Clean Sub strips (subtitle box + text-logo / watermark boxes), produced by Python while this same
+    # ffmpeg encodes (one decode + one encode)
+    use_ai_clean = ai_clean and bool(ai_clean_boxes(project)) and not source_video_override
     ai_stream_idx: Optional[int] = None
     if use_ai_clean:
         if on_progress:
-            on_progress(6.0, "Đang khởi động AI xóa sub (OCR CPU + GPU)...")
-        probe = AICleanStream(project, preview_seconds)
+            on_progress(6.0, "Đang khởi động AI xóa sub / chữ logo (OCR + tái tạo nền)...")
+        probe = make_clean_stream(project, preview_seconds)
         inputs.extend(probe.ffmpeg_input_args())
         ai_stream_idx = next_input_idx
         next_input_idx += 1
 
-    # Build filter_complex chain
-    filters: List[str] = []
-    cur_v = "0:v"
+    # Build filter_complex chain. Two variants of the same graph:
+    #  - GPU (NVIDIA): NVDEC decode -> frames stay in VRAM -> overlay_cuda for every layer -> NVENC. Only the
+    #    small overlay inputs (AI strip, subtitle PNGs, logo, CTA) are prepared on the CPU and uploaded.
+    #    RTX 3060 1080p, ffmpeg alone: 505 fps vs 441 fps with CPU decode + CPU overlays, and the CPU is
+    #    left to the ROI reader + AI Clean Sub.
+    #  - CPU: software decode + overlay filters (any encoder; also the fallback if the GPU graph fails).
+    def _ev(v: int) -> int:
+        return v - (v % 2)  # yuv420p overlays on the GPU need even offsets (chroma is half size)
 
-    # 0. AI Clean Sub overlay (cleaned ROI strip on top of the original frame, frame-exact)
-    if ai_stream_idx is not None:
-        filters.extend(probe.overlay_filters(cur_v, ai_stream_idx, "v_after_clean"))
-        cur_v = "v_after_clean"
+    def _video_chain(gpu: bool) -> tuple[List[str], str]:
+        vf: List[str] = []
+        cur = "0:v"
+        ov = "overlay_cuda" if gpu else "overlay"
+        to_gpu = ",format=yuva420p,hwupload_cuda" if gpu else ""
+        if gpu:
+            vf.append("[0:v]scale_cuda=format=yuv420p[v_gpu]")
+            cur = "v_gpu"
 
-    # 1. Sub removal (Blur box mode)
-    if cfg.sub_removal.mode == "blur":
-        bx, by, bw, bh = _clamp_box_pixels(
-            cfg.sub_removal.box.x,
-            cfg.sub_removal.box.y,
-            cfg.sub_removal.box.w,
-            cfg.sub_removal.box.h,
-            vw,
-            vh,
-        )
-        # Ensure boxblur radius doesn't exceed chroma plane limits (min(bw, bh)/4)
-        max_rad = max(2, min(bw, bh) // 4 - 1)
-        rad = min(max(2, cfg.sub_removal.blur_strength), max_rad)
-        filters.append(f"[{cur_v}]split=2[vbase][vblursrc]")
-        filters.append(
-            f"[vblursrc]crop={bw}:{bh}:{bx}:{by},boxblur=luma_radius={rad}:luma_power=2:chroma_radius={max(1, rad // 2)}:chroma_power=1[vblurred]"
-        )
-        filters.append(f"[vbase][vblurred]overlay={bx}:{by}[v_after_blur]")
-        cur_v = "v_after_blur"
+        # 0. AI Clean Sub overlay (cleaned ROI strip on top of the original frame, frame-exact)
+        if ai_stream_idx is not None:
+            vf.extend(probe.overlay_filters(cur, ai_stream_idx, "v_after_clean", gpu=gpu))
+            cur = "v_after_clean"
 
-    # 2. Subtitle overlay
-    if sub_input_idx is not None:
-        sx, sy = sub_box_xy
-        filters.append(
-            f"[{cur_v}][{sub_input_idx}:v]overlay=x={sx}:y={sy}:eof_action=pass:shortest=0[v_after_sub]"
-        )
-        cur_v = "v_after_sub"
+        # 1. Sub removal (Blur box mode) - CPU graph only (no CUDA box blur)
+        if cfg.sub_removal.mode == "blur":
+            bx, by, bw, bh = _clamp_box_pixels(
+                cfg.sub_removal.box.x, cfg.sub_removal.box.y, cfg.sub_removal.box.w, cfg.sub_removal.box.h, vw, vh
+            )
+            # Ensure boxblur radius doesn't exceed chroma plane limits (min(bw, bh)/4)
+            max_rad = max(2, min(bw, bh) // 4 - 1)
+            rad = min(max(2, cfg.sub_removal.blur_strength), max_rad)
+            vf.append(f"[{cur}]split=2[vbase][vblursrc]")
+            vf.append(
+                f"[vblursrc]crop={bw}:{bh}:{bx}:{by},boxblur=luma_radius={rad}:luma_power=2:chroma_radius={max(1, rad // 2)}:chroma_power=1[vblurred]"
+            )
+            vf.append(f"[vbase][vblurred]overlay={bx}:{by}[v_after_blur]")
+            cur = "v_after_blur"
 
-    # 3. Logo overlay (independent WxH)
-    if logo_input_idx is not None:
-        lx, ly, lw, lh = _clamp_box_pixels(
-            cfg.logo.box.x, cfg.logo.box.y, cfg.logo.box.w, cfg.logo.box.h, vw, vh
-        )
-        op = max(0.0, min(1.0, cfg.logo.opacity))
-        filters.append(
-            f"[{logo_input_idx}:v]scale={lw}:{lh}:flags=lanczos,format=rgba,colorchannelmixer=aa={op:.3f}[vlogo]"
-        )
-        filters.append(f"[{cur_v}][vlogo]overlay=x={lx}:y={ly}:format=auto[v_after_logo]")
-        cur_v = "v_after_logo"
+        # 1b. Text-logo / watermark regions, blur mode (AI mode goes through the AI clean stream above)
+        wm = cfg.wm_removal
+        if wm.enabled and wm.mode == "blur":
+            for i, b in enumerate(wm.boxes):
+                bx, by, bw, bh = _clamp_box_pixels(b.x, b.y, b.w, b.h, vw, vh)
+                rad = min(max(2, wm.blur_strength), max(2, min(bw, bh) // 4 - 1))
+                vf.append(f"[{cur}]split=2[wmb{i}][wms{i}]")
+                vf.append(
+                    f"[wms{i}]crop={bw}:{bh}:{bx}:{by},boxblur=luma_radius={rad}:luma_power=2:"
+                    f"chroma_radius={max(1, rad // 2)}:chroma_power=1[wmz{i}]"
+                )
+                vf.append(f"[wmb{i}][wmz{i}]overlay={bx}:{by}[v_after_wm{i}]")
+                cur = f"v_after_wm{i}"
 
-    # 4. Green-screen CTA overlay (chroma key + independent WxH)
-    if gs_input_idx is not None:
-        gx, gy, gw, gh = _clamp_box_pixels(
-            cfg.green_screen.box.x,
-            cfg.green_screen.box.y,
-            cfg.green_screen.box.w,
-            cfg.green_screen.box.h,
-            vw,
-            vh,
-        )
-        ck_hex = _sanitize_hex(cfg.green_screen.chroma_color)
-        sim = max(0.01, min(0.8, cfg.green_screen.similarity))
-        bld = max(0.0, min(0.5, cfg.green_screen.blend))
-        start_s = max(0.0, cfg.green_screen.start_sec)
-        gs_chain = (
-            f"[{gs_input_idx}:v]scale={gw}:{gh}:flags=lanczos,"
-            f"chromakey=color={ck_hex}:similarity={sim:.3f}:blend={bld:.3f},"
-            f"setpts=PTS-STARTPTS+{start_s:.3f}/TB[vgs]"
-        )
-        filters.append(gs_chain)
-        eof_act = "repeat" if cfg.green_screen.loop_enabled else "pass"
-        filters.append(
-            f"[{cur_v}][vgs]overlay=x={gx}:y={gy}:eof_action={eof_act}:shortest=0:enable='gte(t,{start_s:.3f})'[v_after_gs]"
-        )
-        cur_v = "v_after_gs"
+        # 2. Subtitle overlay
+        if sub_input_idx is not None:
+            sx, sy = sub_box_xy
+            if gpu:
+                sx, sy = _ev(sx), _ev(sy)
+                vf.append(f"[{sub_input_idx}:v]format=yuva420p,hwupload_cuda[vsub]")
+                vf.append(f"[{cur}][vsub]{ov}=x={sx}:y={sy}:eof_action=pass:shortest=0[v_after_sub]")
+            else:
+                vf.append(f"[{cur}][{sub_input_idx}:v]overlay=x={sx}:y={sy}:eof_action=pass:shortest=0[v_after_sub]")
+            cur = "v_after_sub"
+
+        # 3. Logo overlay (independent WxH)
+        if logo_input_idx is not None:
+            lx, ly, lw, lh = _clamp_box_pixels(cfg.logo.box.x, cfg.logo.box.y, cfg.logo.box.w, cfg.logo.box.h, vw, vh)
+            op = max(0.0, min(1.0, cfg.logo.opacity))
+            vf.append(
+                f"[{logo_input_idx}:v]scale={lw}:{lh}:flags=lanczos,format=rgba,colorchannelmixer=aa={op:.3f}{to_gpu}[vlogo]"
+            )
+            if gpu:
+                # ffmpeg 9 overlay_cuda bug: with eof_action=repeat (needed for a single-image logo) it outputs
+                # frames padded to the 32-aligned pool size (1080 -> 1088, 540 -> 544). So the logo image is
+                # looped (-loop 1) and overlaid with eof_action=pass + shortest=1 instead: same picture.
+                vf.append(f"[{cur}][vlogo]{ov}=x={_ev(lx)}:y={_ev(ly)}:eof_action=pass:shortest=1[v_after_logo]")
+            else:
+                vf.append(f"[{cur}][vlogo]overlay=x={lx}:y={ly}:format=yuv420[v_after_logo]")
+            cur = "v_after_logo"
+
+        # 3b. Channel name text (endless input -> shortest=1 ends it with the video; eof_action=pass also avoids
+        #     the overlay_cuda frame-size bug of eof_action=repeat)
+        if ch_input_idx is not None:
+            cx, cy = ch_xy
+            if gpu:
+                vf.append(f"[{ch_input_idx}:v]format=yuva420p,hwupload_cuda[vch]")
+                vf.append(f"[{cur}][vch]{ov}=x={_ev(cx)}:y={_ev(cy)}:eof_action=pass:shortest=1[v_after_ch]")
+            else:
+                vf.append(f"[{cur}][{ch_input_idx}:v]overlay=x={cx}:y={cy}:eof_action=pass:shortest=1:format=yuv420[v_after_ch]")
+            cur = "v_after_ch"
+
+        # 4. Green-screen CTA overlay (chroma key + independent WxH)
+        if gs_input_idx is not None:
+            gx, gy, gw, gh = _clamp_box_pixels(
+                cfg.green_screen.box.x, cfg.green_screen.box.y, cfg.green_screen.box.w, cfg.green_screen.box.h, vw, vh
+            )
+            ck_hex = _sanitize_hex(cfg.green_screen.chroma_color)
+            sim = max(0.01, min(0.8, cfg.green_screen.similarity))
+            bld = max(0.0, min(0.5, cfg.green_screen.blend))
+            start_s = max(0.0, cfg.green_screen.start_sec)
+            vf.append(
+                f"[{gs_input_idx}:v]scale={gw}:{gh}:flags=lanczos,"
+                f"chromakey=color={ck_hex}:similarity={sim:.3f}:blend={bld:.3f},"
+                f"setpts=PTS-STARTPTS+{start_s:.3f}/TB{to_gpu}[vgs]"
+            )
+            eof_act = "repeat" if cfg.green_screen.loop_enabled else "pass"
+            shortest = 0
+            if gpu:
+                gx, gy = _ev(gx), _ev(gy)
+                # same overlay_cuda repeat bug as the logo: the looped CTA input never ends anyway
+                eof_act, shortest = "pass", int(cfg.green_screen.loop_enabled)
+            vf.append(
+                f"[{cur}][vgs]{ov}=x={gx}:y={gy}:eof_action={eof_act}:shortest={shortest}:enable='gte(t,{start_s:.3f})'[v_after_gs]"
+            )
+            cur = "v_after_gs"
+        return vf, cur
 
     # 5. Audio routing (Original volume/mute + assembled Narration/Dubbing WAV)
+    filters: List[str] = []  # audio filters (video chains are built per variant above)
     audio_map_args: List[str] = []
     orig_vol = 0.0 if cfg.audio.mute_original else max(0.0, cfg.audio.original_volume)
     if voice_input_idx is not None:
@@ -268,24 +354,42 @@ def render_project_sync(
     safe_stem = re.sub(r'[<>:"/\\|?*]+', "_", Path(project.name).stem)
     out_path = OUTPUTS_DIR / f"{safe_stem}_{project.id[:6]}{suffix}"
 
-    cmd = [ffmpeg] + inputs
-    if filters:
-        cmd.extend(["-filter_complex", ";".join(filters)])
-        cmd.extend(["-map", f"[{cur_v}]"])
-    else:
-        cmd.extend(["-map", "0:v"])
+    hw = detect_hardware()
+    use_gpu_graph = (
+        GPU_GRAPH_ENABLED
+        and encoder == "h264_nvenc"
+        and cfg.sub_removal.mode != "blur"
+        and not (cfg.wm_removal.enabled and cfg.wm_removal.mode == "blur")
+        and bool(hw.get("encoders", {}).get("h264_nvenc"))
+    )
 
-    cmd.extend(audio_map_args)
-    cmd.extend(_encoder_args(encoder))
-    if preview_seconds and preview_seconds > 0:
-        cmd.extend(["-t", f"{total_dur:.3f}"])
-    cmd.extend(["-movflags", "+faststart", str(out_path)])
+    def _build_cmd(gpu: bool, enc: str) -> List[str]:
+        vf, cur_v = _video_chain(gpu)
+        inp = list(inputs)
+        if gpu:
+            if logo_at >= 0:
+                inp[logo_at:logo_at] = ["-loop", "1"]  # before the hwaccel insert (smaller index) shifts it
+            inp[hwaccel_at:hwaccel_at] = ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        c = [ffmpeg] + inp
+        if vf or filters:
+            c.extend(["-filter_complex", ";".join(vf + filters)])
+        # Only filter outputs take brackets: an audio-only filter graph (e.g. original volume 15%, no subtitle /
+        # logo / sub removal) leaves the video at "0:v", and "-map [0:v]" made ffmpeg abort.
+        c.extend(["-map", "0:v" if cur_v == "0:v" else f"[{cur_v}]"])
+        c.extend(audio_map_args)
+        c.extend(_encoder_args(enc, gpu_frames=gpu))
+        if preview_seconds and preview_seconds > 0:
+            c.extend(["-t", f"{total_dur:.3f}"])
+        c.extend(["-movflags", "+faststart", str(out_path)])
+        return c
+
+    cmd = _build_cmd(use_gpu_graph, encoder)
 
     if on_progress:
         on_progress(12.0, f"Đang xuất video bằng {encoder}...")
 
     def _execute(run_cmd: List[str], enc_name: str) -> tuple[int, str]:
-        stream = AICleanStream(project, preview_seconds) if use_ai_clean else None
+        stream = make_clean_stream(project, preview_seconds) if use_ai_clean else None
         proc = subprocess.Popen(
             run_cmd,
             stdin=subprocess.PIPE if stream else subprocess.DEVNULL,
@@ -346,20 +450,37 @@ def render_project_sync(
             raise RuntimeError(f"AI xóa sub lỗi: {stream.error}")
         return ret_code, b"".join(err_chunks).decode("utf-8", "replace")
 
-    ret, stderr_out = _execute(cmd, encoder)
+    def _timed(run_cmd: List[str], enc_name: str, label: str) -> tuple[int, str]:
+        """_execute + a stopwatch step whose note is the speed reached (fps, x real time)."""
+        st = timing.begin_step(project.id, "render", label)
+        t0 = time.time()
+        try:
+            r = _execute(run_cmd, enc_name)
+        except BaseException:
+            timing.end_step(st, ok=False)
+            raise
+        dt = max(0.001, time.time() - t0)
+        fps = total_dur * max(1.0, float(project.fps or 30.0)) / dt
+        timing.end_step(st, ok=r[0] == 0, note=f"{enc_name} · {fps:.0f} fps · {total_dur / dt:.1f}× thời gian thực")
+        return r
 
-    # Automatic safe fallback to libx264 if a hardware driver hiccup occurs
+    main_label = "Xóa sub AI + xuất video" if use_ai_clean else "Xuất video"
+    ret, stderr_out = _timed(
+        cmd, encoder if not use_gpu_graph else f"{encoder} + NVDEC/CUDA", main_label + (" (GPU)" if use_gpu_graph else "")
+    )
+    if ret == 0 and use_gpu_graph and not _output_size_ok(out_path, vw, vh):
+        ret, stderr_out = 1, "GPU graph produced a wrong frame size"  # safety net -> CPU graph below
+
+    # Fallbacks (OCR results are cached -> no re-scan): GPU graph -> CPU graph (same encoder) -> libx264.
+    # The GPU graph fails e.g. for codecs NVDEC cannot decode (frames then arrive in system memory).
+    if ret != 0 and use_gpu_graph:
+        if on_progress:
+            on_progress(14.0, "Đồ họa GPU (NVDEC/CUDA) lỗi với video này, chuyển sang lọc bằng CPU...")
+        ret, stderr_out = _timed(_build_cmd(False, encoder), encoder, main_label + " (dự phòng: lọc bằng CPU)")
     if ret != 0 and encoder != "libx264":
         if on_progress:
             on_progress(15.0, f"{encoder} gặp lỗi driver, đang chuyển dự phòng sang libx264...")
-        fallback_cmd = cmd.copy()
-        enc_idx = fallback_cmd.index("-c:v")
-        # Replace encoder args slice up to -t or -movflags
-        end_idx = fallback_cmd.index("-movflags")
-        if "-t" in fallback_cmd[enc_idx:end_idx]:
-            end_idx = fallback_cmd.index("-t", enc_idx)
-        fallback_cmd[enc_idx:end_idx] = _encoder_args("libx264")
-        ret2, err2 = _execute(fallback_cmd, "libx264")  # OCR results are cached -> no re-scan
+        ret2, err2 = _timed(_build_cmd(False, "libx264"), "libx264", main_label + " (dự phòng: libx264)")
         if ret2 != 0:
             raise RuntimeError(f"FFmpeg thất bại ({encoder} & libx264): {err2.strip()[-600:]}")
     elif ret != 0:

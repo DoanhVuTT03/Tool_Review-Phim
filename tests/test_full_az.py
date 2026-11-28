@@ -1,4 +1,5 @@
-import asyncio
+﻿import asyncio
+import re
 import shutil
 import subprocess
 import sys
@@ -66,6 +67,10 @@ def create_hardsub_movie(asset_dir: Path):
 
 async def fake_llm_caller(cfg, system_prompt: str, user_prompt: str) -> str:
     """Deterministic test stub verifying gem.txt rules, 2-phase Style Guide, and <id>|||<text> parsing."""
+    if "RÚT GỌN" in user_prompt:  # length_fit: lines still too long for their time on screen
+        assert "<số>|||<tối đa N" in user_prompt
+        ids = re.findall(r"^(\d+)\|\|\|\d+\|\|\|", user_prompt, re.M)
+        return "\n".join(f"{i}|||Câu ngắn gọn." for i in ids)
     assert "dịch giả phụ đề" in system_prompt.lower()
     if "PHÂN TÍCH FILE ĐÍNH KÈM" in user_prompt:
         return (
@@ -75,7 +80,8 @@ async def fake_llm_caller(cfg, system_prompt: str, user_prompt: str) -> str:
             "4. VĂN PHONG: Cuốn hút, súc tích chuẩn review phim YouTube"
         )
     assert "STYLE GUIDE ĐÃ CHỐT" in user_prompt
-    assert "±" in user_prompt
+    # every line carries its length budget: "<số>|||<N>|||<câu gốc>"
+    assert "TỐI ĐA của câu dịch" in user_prompt and re.search(r"^1\|\|\|\d+\|\|\|", user_prompt, re.M)
     return (
         "1|||Xin chào mọi người, chào mừng đến với tập review phim hôm nay.\n"
         "2|||Cuối cùng nam chính cũng phát hiện ra bí mật động trời phía sau."

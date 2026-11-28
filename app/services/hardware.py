@@ -136,15 +136,34 @@ def detect_hardware(force_refresh: bool = False) -> Dict[str, Any]:
         dml_ok = "DmlExecutionProvider" in ort.get_available_providers()
     except Exception:
         pass
+    # Physical GPUs only (no "Basic Render" / virtual display adapters such as MuMuPlayer's).
+    real_gpus = [g for g in all_gpu_names if not any(x in g.lower() for x in ("basic render", "virtual", "mumu", "parsec", "remote"))]
     ai_device = "cpu+directml" if dml_ok else "cpu"
-    ocr_devices = "CPU + " + " + ".join(all_gpu_names) + " (DirectML)" if dml_ok and all_gpu_names else "CPU"
+    ocr_devices = "CPU + " + " + ".join(dict.fromkeys(real_gpus)) + " (DirectML)" if dml_ok and real_gpus else "CPU"
     dual_gpu_capable = bool(qsv_ok and nvidia_gpus and not nvenc_ok) or bool(qsv_ok and nvenc_ok)
+    # AI Clean Sub inpainting threads (OpenCV releases the GIL, so this scales ~linearly). Leave ~4 hardware
+    # threads for the render ffmpeg (decode + overlays) and the ROI reader: 4C/8T laptop -> 4, 6C/12T -> 8.
+    inpaint_workers = max(2, min(16, cpu_threads - 4))
 
+    import importlib.util
+
+    torch_cuda_pkg = bool(importlib.util.find_spec("torch")) and bool(importlib.util.find_spec("onnx2torch"))
     if nvenc_ok and max_nvidia_vram >= 6000 and cpu_cores >= 6:
         tier = "workstation"
-        rec_render_workers = min(4, max(2, cpu_cores // 3))
+        # One NVENC chip on GeForce cards: 2 renders in parallel keep it busy while the other one is in
+        # Python/CPU stages; more only fights over the same CPU cores.
+        rec_render_workers = 2
         rec_io_workers = 10
-        summary = f"Máy khỏe (NVIDIA NVENC + {max_nvidia_vram}MB VRAM) — Chạy tối đa đa luồng."
+        if torch_cuda_pkg:
+            summary = (
+                f"Máy khỏe: {nvidia_gpus[0]['name']} ({max_nvidia_vram} MB VRAM) — toàn bộ trên GPU: NVDEC giải mã, "
+                f"CUDA ghép lớp, NVENC nén; AI OCR + tái tạo nền xóa sub chạy CUDA (PyTorch)."
+            )
+        else:
+            summary = (
+                f"Máy khỏe: {nvidia_gpus[0]['name']} ({max_nvidia_vram} MB VRAM) — NVDEC/CUDA/NVENC; AI OCR qua "
+                f"DirectML, tái tạo nền {inpaint_workers} luồng CPU (chạy setup.bat để cài PyTorch CUDA: nhanh ~2x)."
+            )
     elif qsv_ok and nvidia_gpus:
         tier = "dual_gpu_laptop"
         rec_render_workers = 1
@@ -165,6 +184,12 @@ def detect_hardware(force_refresh: bool = False) -> Dict[str, Any]:
         rec_io_workers = 4
         summary = "Chế độ CPU phần mềm (libx264)."
 
+    if not dml_ok and platform.system() == "Windows":
+        summary += (
+            " ⚠ AI OCR đang chạy CPU vì gói onnxruntime thường đã đè lên onnxruntime-directml"
+            " — chạy setup.bat để sửa."
+        )
+
     _HARDWARE_CACHE = {
         "cpu_name": platform.processor() or "CPU",
         "cpu_cores": cpu_cores,
@@ -183,6 +208,9 @@ def detect_hardware(force_refresh: bool = False) -> Dict[str, Any]:
         },
         "recommended_encoder": recommended_encoder,
         "ai_device": ai_device,
+        "directml_ok": dml_ok,
+        "inpaint_workers": inpaint_workers,
+        "torch_cuda_installed": torch_cuda_pkg,
         "ocr_devices": ocr_devices,
         "dual_gpu_capable": dual_gpu_capable,
         "tier": tier,

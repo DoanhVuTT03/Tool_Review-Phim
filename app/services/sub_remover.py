@@ -9,6 +9,11 @@ Speed design (measured on i7-1065G7 + Iris Plus + MX230, 1080p VP9):
   are piped straight into the FINAL render ffmpeg, which overlays them and encodes once. No intermediate
   "clean" video, no second encode, Python never touches full 1080p frames. RAM is used as bounded queues /
   look-ahead buffers so decode, OCR, inpaint and encode all overlap.
+
+Strong-GPU tuning (measured on i5-12400F 6C/12T + RTX 3060 12 GB, 1080p, ~203 -> ~236 fps, ~270 with pre-scan):
+- inpaint pool sized from CPU threads (was fixed at 4 = the bottleneck), NVENC p2, overlay format=yuv420;
+- GPU OCR in separate processes (_ProcDetector): in-process DirectML Run() took ~100 ms under a full render;
+- A-Z pipeline pre-scans OCR keys (AICleanStream.prescan) while translation / TTS wait on the network.
 """
 from __future__ import annotations
 
@@ -29,7 +34,7 @@ import cv2
 import numpy as np
 
 from app.config import MODELS_DIR, PROJECTS_DIR, get_ffmpeg_path
-from app.models import SubRemovalConfig, VideoProject
+from app.models import BoxRect, SubRemovalConfig, VideoProject
 from app.services.cancel import check_cancel, is_cancelled, register_proc, unregister_proc
 from app.services.hardware import detect_hardware
 
@@ -47,6 +52,7 @@ _DET_MIN_BOX_SCORE = 0.5
 _SCAN_QUEUE_FRAMES = 256        # RAM buffer between decoder and detectors (~170 MB for a 1600x140 strip)
 _CLEAN_CHUNK = 48               # frames inpainted per parallel chunk in pass 2
 _REF_WINDOW_SEC = 1.5           # temporal propagation: max distance to a clean reference frame
+_GPU_OCR_PROCS = 3              # detector processes per strong (>= 4 GB) GPU, see _ProcDetector
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -84,6 +90,10 @@ class _TextDetector:
         if device == "dml" and self._det.infer.session.get_providers()[0] != "DmlExecutionProvider":
             raise RuntimeError("DirectML not active")
         self.count = 0
+        self.vram_mb = 0
+        # Detectors are cached and shared: the A-Z batch runs up to 2 AI renders at once, and a DirectML
+        # session crashes when Run() is called from two threads concurrently.
+        self._lock = threading.Lock()
 
     def detect(self, roi_bgr: np.ndarray) -> Optional[np.ndarray]:
         """Returns int32 polygons (N,4,2) in ROI coordinates, or None when no text.
@@ -99,7 +109,8 @@ class _TextDetector:
         dw = max(32, int(round(w * ratio / 32)) * 32)
         img = cv2.resize(roi_bgr, (dw, dh), interpolation=cv2.INTER_LINEAR) if (dw, dh) != (w, h) else roi_bgr
         blob = cv2.dnn.blobFromImage(img, scalefactor=1.0 / 127.5, mean=(127.5, 127.5, 127.5), swapRB=False)
-        preds = self._det.infer(blob)[0]
+        with self._lock:
+            preds = self._det.infer(blob)[0]
         boxes, _ = self._det.postprocess_op(preds, (h, w))
         boxes = self._det.filter_tag_det_res(boxes, (h, w))
         self.count += 1
@@ -108,8 +119,71 @@ class _TextDetector:
         return np.asarray(boxes, dtype=np.int32)
 
 
-def _dxgi_adapter_names() -> List[str]:
-    """Hardware adapter names in DXGI order (= DirectML device_id order). Windows only; [] on failure."""
+class _ChunkItem:
+    """Future-like view on one frame of a GPU chunk result (the writer only calls .result())."""
+
+    __slots__ = ("_f", "_k")
+
+    def __init__(self, fut, k: int) -> None:
+        self._f, self._k = fut, k
+
+    def result(self):
+        return self._f.result()[self._k]
+
+
+class _ProcDetector:
+    """Same interface as _TextDetector, but the DirectML detector lives in its own process
+    (app/services/ocr_worker.py), isolated from the busy render process. Used for strong GPUs only:
+    in-process Run() took ~100 ms under a full render vs ~24 ms in a separate process (RTX 3060)."""
+
+    device = "dml"
+
+    def __init__(self, device_id: int, label: str, vram_mb: int) -> None:
+        import struct
+        import sys
+
+        from app.config import BASE_DIR
+
+        self._struct = struct
+        self.label = label
+        self.vram_mb = vram_mb
+        self.count = 0
+        self._lock = threading.Lock()
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "app.services.ocr_worker", str(device_id)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=str(BASE_DIR),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+    def detect(self, roi_bgr: np.ndarray) -> Optional[np.ndarray]:
+        h, w = roi_bgr.shape[:2]
+        with self._lock:
+            if self.proc.poll() is not None:
+                raise RuntimeError("tiến trình OCR GPU đã dừng")
+            self.proc.stdin.write(self._struct.pack("<II", h, w))
+            self.proc.stdin.write(np.ascontiguousarray(roi_bgr).data)
+            self.proc.stdin.flush()
+            hdr = _read_exact(self.proc.stdout, 4)
+            data = _read_exact(self.proc.stdout, self._struct.unpack("<I", hdr)[0]) if hdr else None
+        if data is None:
+            raise RuntimeError("tiến trình OCR GPU không phản hồi")
+        res = json.loads(data)
+        if isinstance(res, dict):
+            raise RuntimeError(res.get("error", "OCR GPU lỗi"))
+        self.count += 1
+        return None if res is None else np.asarray(res, dtype=np.int32)
+
+    def close(self) -> None:
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+
+
+def _dxgi_adapters() -> List[Dict[str, Any]]:
+    """Physical GPUs in DXGI order (index = DirectML device_id). Software adapters are skipped and the same
+    card listed twice (e.g. MuMuPlayer / virtual-display drivers add a 2nd LUID for one RTX) is kept once.
+    Windows only; [] on failure."""
     try:
         import ctypes
         from ctypes import POINTER, byref, c_void_p
@@ -134,7 +208,8 @@ def _dxgi_adapter_names() -> List[str]:
             vtbl = ctypes.cast(obj, POINTER(POINTER(c_void_p))).contents
             return ctypes.WINFUNCTYPE(ctypes.c_long, c_void_p, *argtypes)(vtbl[idx])
 
-        names: List[str] = []
+        out: List[Dict[str, Any]] = []
+        seen = set()
         i = 0
         while True:
             adapter = c_void_p()
@@ -142,45 +217,97 @@ def _dxgi_adapter_names() -> List[str]:
                 break
             desc = DESC1()
             _method(adapter, 10, POINTER(DESC1))(adapter, byref(desc))  # GetDesc1
-            names.append("" if desc.Flags & 2 else desc.Description)  # DXGI_ADAPTER_FLAG_SOFTWARE -> ""
             _method(adapter, 2)(adapter)  # Release
+            vram_mb = int(desc.DedicatedVideoMemory) >> 20
+            ident = (desc.VendorId, desc.DeviceId, desc.SubSysId, desc.Revision, vram_mb)
+            if not desc.Flags & 2 and ident not in seen:  # DXGI_ADAPTER_FLAG_SOFTWARE
+                seen.add(ident)
+                out.append({"device_id": i, "name": desc.Description, "vram_mb": vram_mb})
             i += 1
         _method(factory, 2)(factory)
-        return names
+        return out
     except Exception:
         return []
 
 
-def _lower_thread_priority() -> None:
+def _short_gpu_name(name: str) -> str:
+    low = name.lower()
+    if "iris" in low:
+        return "Iris"
+    for prefix in ("NVIDIA GeForce ", "NVIDIA ", "AMD Radeon ", "Intel(R) "):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _set_thread_priority(level: int) -> None:
+    """Windows thread priority: -2 LOWEST, 0 NORMAL, 2 HIGHEST."""
     try:
         import ctypes
 
         k32 = ctypes.windll.kernel32
-        k32.SetThreadPriority(k32.GetCurrentThread(), -2)  # THREAD_PRIORITY_LOWEST
+        k32.SetThreadPriority(k32.GetCurrentThread(), level)
     except Exception:
         pass
 
 
+def _lower_thread_priority() -> None:
+    _set_thread_priority(-2)  # THREAD_PRIORITY_LOWEST
+
+
 def _get_detectors() -> List[_TextDetector]:
-    """CPU detector + one per DirectML adapter that works. Built once and cached."""
+    """CPU detector + one DirectML session per physical GPU that works. Built once and cached.
+
+    Exactly one session per GPU: two sessions on the same DirectML device run from two threads crash
+    (DmlCommandRecorder 0x80004005 / segfault), and batching several strips per Run() is not faster on DML.
+    One RTX 3060 session does ~6-10 ms per sample, i.e. far more samples/s than a 450 fps render needs."""
     global _DETECTORS
     with _DETECTORS_LOCK:
         if _DETECTORS is not None:
             return _DETECTORS
-        dets: List[_TextDetector] = [_TextDetector("cpu", label="CPU")]
+        dets: List[Any] = [_TextDetector("cpu", label="CPU")]
+        # 1st choice on NVIDIA >= 4 GB with torch CUDA: batched detector in this process's CUDA context
+        # (gpu_ocr.py). Then the NVIDIA card needs no DirectML processes.
+        cuda_det = None
+        try:
+            from app.services.gpu_ocr import get_torch_detector
+
+            cuda_det = get_torch_detector(_DET_LIMIT_SIDE, _DET_MIN_BOX_SCORE)
+        except Exception:
+            cuda_det = None
+        if cuda_det is not None:
+            dets.append(cuda_det)
         try:
             import onnxruntime as ort
 
             if "DmlExecutionProvider" in ort.get_available_providers():
-                gpu_names = _dxgi_adapter_names() or (detect_hardware().get("gpus") or [])
+                adapters = _dxgi_adapters() or [
+                    {"device_id": i, "name": n, "vram_mb": 0}
+                    for i, n in enumerate(detect_hardware().get("gpus") or [])
+                    if n and "basic render" not in n.lower()
+                ]
                 probe = np.zeros((96, 960, 3), dtype=np.uint8)
-                for dev_id, name in enumerate(gpu_names):
-                    if not name or "basic render" in name.lower():
-                        continue
-                    short = "Iris" if "iris" in name.lower() else ("MX230" if "mx230" in name.lower() else name)
+                for ad in adapters:
+                    label = _short_gpu_name(ad["name"])
+                    d: Any = None
+                    if cuda_det is not None and ad["vram_mb"] >= 4000:
+                        continue  # this card already runs the CUDA detector
+                    if ad["vram_mb"] >= 4000:  # strong GPU: detectors in their own processes (see _ProcDetector)
+                        procs = [_ProcDetector(ad["device_id"], f"{label}#{i + 1}", ad["vram_mb"])
+                                 for i in range(_GPU_OCR_PROCS)]
+                        for p in procs:  # started together, so the ~2 s model loads overlap
+                            try:
+                                p.detect(probe)
+                                dets.append(p)
+                            except Exception:
+                                p.close()
+                        if any(isinstance(x, _ProcDetector) for x in dets):
+                            continue
                     try:
-                        d = _TextDetector("dml", dev_id, label=f"GPU{dev_id}:{short}")
-                        d.detect(probe)
+                        if d is None:
+                            d = _TextDetector("dml", ad["device_id"], label=label)
+                            d.detect(probe)
+                            d.vram_mb = ad["vram_mb"]
                         dets.append(d)
                     except Exception:
                         continue
@@ -195,22 +322,49 @@ def _get_detectors() -> List[_TextDetector]:
 # ----------------------------------------------------------------------------------------------------
 
 
+_LAMA_LOCK = threading.Lock()
+_LAMA_ERROR = ""
+
+
 def _get_lama_session():
-    """Loads optional LaMa ONNX model if user downloaded it into data/models/lama_fp32.onnx."""
-    global _LAMA_SESSION
-    if _LAMA_SESSION is not None:
-        return _LAMA_SESSION
-    model_path = MODELS_DIR / "lama_fp32.onnx"
-    if not model_path.exists():
-        return None
-    try:
-        import onnxruntime as ort
-        providers = ort.get_available_providers()
-        preferred = [p for p in ("CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider") if p in providers]
-        _LAMA_SESSION = ort.InferenceSession(str(model_path), providers=preferred or ["CPUExecutionProvider"])
-        return _LAMA_SESSION
-    except Exception:
-        return None
+    """Loads optional LaMa ONNX model (data/models/lama_fp32.onnx) on a GPU provider and test-runs it once.
+
+    Returns None (caller falls back to the fast Navier-Stokes fill) when the model is missing or cannot run on
+    the GPU: the public LaMa ONNX export fails on DirectML (MatMul '...rttn/MatMul_5' -> 0x80070057) and on CPU
+    it takes ~1 s per frame, which would make a render take hours. Measured on RTX 3060: CUDA ~150 ms/frame."""
+    global _LAMA_SESSION, _LAMA_ERROR
+    with _LAMA_LOCK:
+        if _LAMA_SESSION is not None:
+            return _LAMA_SESSION
+        if _LAMA_ERROR:
+            return None
+        model_path = MODELS_DIR / "lama_fp32.onnx"
+        if not model_path.exists():
+            _LAMA_ERROR = "chưa có data/models/lama_fp32.onnx"
+            return None
+        try:
+            import onnxruntime as ort
+
+            providers = ort.get_available_providers()
+            gpu = [p for p in ("CUDAExecutionProvider", "DmlExecutionProvider") if p in providers]
+            if not gpu:
+                _LAMA_ERROR = "không có GPU provider (CUDA/DirectML)"
+                return None
+            so = ort.SessionOptions()
+            so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            if gpu[0] == "DmlExecutionProvider":
+                so.enable_mem_pattern = False
+                so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            sess = ort.InferenceSession(str(model_path), sess_options=so, providers=[gpu[0]])
+            z = np.zeros((1, 3, 512, 512), dtype=np.float32)
+            m = np.zeros((1, 1, 512, 512), dtype=np.float32)
+            m[..., 200:260, 100:400] = 1.0
+            sess.run(None, {sess.get_inputs()[0].name: z, sess.get_inputs()[1].name: m})
+            _LAMA_SESSION = sess
+            return sess
+        except Exception as e:  # noqa: BLE001
+            _LAMA_ERROR = f"LaMa không chạy được trên GPU này ({str(e).splitlines()[0][:80]})"
+            return None
 
 
 def _inpaint_lama_roi(roi_bgr: np.ndarray, mask: np.ndarray, session) -> np.ndarray:
@@ -225,7 +379,8 @@ def _inpaint_lama_roi(roi_bgr: np.ndarray, mask: np.ndarray, session) -> np.ndar
     mask_in = resized_mask[None, None, ...]
 
     inputs = {session.get_inputs()[0].name: img_in, session.get_inputs()[1].name: mask_in}
-    out = session.run(None, inputs)[0][0]
+    with _LAMA_LOCK:  # one GPU session shared by the inpaint pool; DirectML forbids concurrent Run()
+        out = session.run(None, inputs)[0][0]
     out_rgb = np.clip(np.transpose(out, (1, 2, 0)), 0, 255).astype(np.uint8)
     if out_rgb.max() <= 1:
         out_rgb = np.clip(np.transpose(out, (1, 2, 0)) * 255.0, 0, 255).astype(np.uint8)
@@ -351,7 +506,9 @@ def _drain_stderr(proc: subprocess.Popen, sink: List[bytes]) -> threading.Thread
 
 def _roi_reader_cmd(ffmpeg: str, src: Path, rect: Tuple[int, int, int, int], limit_sec: Optional[float]) -> List[str]:
     """Decodes the source and emits ONLY the ROI strip of every frame (raw BGR). Uses the same decoder and
-    the same input -t as the render command, so it yields exactly the same frames, in the same order."""
+    the same input -t as the render command, so it yields exactly the same frames, in the same order.
+    (NVDEC was tried for this reader on an RTX 3060: no speed gain, and its nv12 path changed pixel rounding
+    enough to alter the glyph test results, so the software decoder is kept.)"""
     rx, ry, rw, rh = rect
     return [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
@@ -359,6 +516,20 @@ def _roi_reader_cmd(ffmpeg: str, src: Path, rect: Tuple[int, int, int, int], lim
         "-vf", f"crop={rw}:{rh}:{rx}:{ry}", "-fps_mode", "passthrough",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
     ]
+
+
+def _read_frame(stream, shape: Tuple[int, int, int]) -> Optional[np.ndarray]:
+    """Reads one raw frame straight into a new numpy array (readinto: no bytearray growth + bytes() copy,
+    i.e. 2 fewer 600 KB copies per frame done while holding the GIL)."""
+    arr = np.empty(shape, dtype=np.uint8)
+    mv = memoryview(arr).cast("B")
+    got, n = 0, mv.nbytes
+    while got < n:
+        k = stream.readinto(mv[got:])
+        if not k:
+            return None
+        got += k
+    return arr
 
 
 def _read_exact(stream, n: int) -> Optional[bytes]:
@@ -389,8 +560,24 @@ class AICleanStream:
     don't scan again.
     """
 
-    def __init__(self, project: VideoProject, preview_seconds: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        project: VideoProject,
+        preview_seconds: Optional[float] = None,
+        box: Optional[BoxRect] = None,
+        source: "Optional[queue.Queue]" = None,
+        text_logo: bool = False,
+    ) -> None:
+        """box: region to clean (default: the subtitle-removal box; text-logo / watermark regions pass theirs).
+        source: frames come from this queue (MultiCleanStream: one shared decode for every region) instead of an
+        own ffmpeg reader; None in the queue = end of video."""
         cfg: SubRemovalConfig = project.config.sub_removal
+        box = box or cfg.box
+        self._source = source
+        # Text logos / watermarks are thin, semi-transparent text: the detector's boxes stop short of the faint
+        # first/last glyph (measured: box started 13 px inside "本" of "本作品含AI生成内容"). Widen each box by ~half
+        # a character (0.45 x text height) horizontally for these regions; subtitle boxes are unchanged.
+        self.text_logo = text_logo
         self.cfg = cfg
         self.project = project
         self.src = Path(project.video_path)
@@ -410,14 +597,18 @@ class AICleanStream:
         def _even(v: int) -> int:
             return v - (v % 2)
 
-        rx = _even(max(0, min(vw - 16, int(round(cfg.box.x * vw)))))
-        ry = _even(max(0, min(vh - 16, int(round(cfg.box.y * vh)))))
-        rw = _even(max(16, min(vw - rx, int(round(cfg.box.w * vw)))))
-        rh = _even(max(16, min(vh - ry, int(round(cfg.box.h * vh)))))
+        self.video_size = (vw, vh)
+        rx = _even(max(0, min(vw - 16, int(round(box.x * vw)))))
+        ry = _even(max(0, min(vh - 16, int(round(box.y * vh)))))
+        rw = _even(max(16, min(vw - rx, int(round(box.w * vw)))))
+        rh = _even(max(16, min(vh - ry, int(round(box.h * vh)))))
         self.rect = (rx, ry, rw, rh)
         self.step = max(1, int(round(self.fps / max(1.0, cfg.ocr_sample_fps))))
         self.ffmpeg = get_ffmpeg_path()
         self.lama = _get_lama_session() if cfg.ai_engine == "lama" else None
+        self.lama_note = f"LaMa tắt: {_LAMA_ERROR} → dùng tái tạo nhanh" if cfg.ai_engine == "lama" and self.lama is None else ""
+        self.inpaint_workers = int(detect_hardware().get("inpaint_workers") or 4)
+        self.inpaint_device = ""
 
         st = self.src.stat()
         key = f"{_OCR_CACHE_VERSION}|{self.src.resolve()}|{st.st_size}|{int(st.st_mtime)}|{self.rect}|{self.step}|{_DET_LIMIT_SIDE}"
@@ -443,20 +634,29 @@ class AICleanStream:
         rx, ry, rw, rh = self.rect
         return ["-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{rw}x{rh}", "-framerate", f"{self.fps:.6f}", "-i", "pipe:0"]
 
-    def overlay_filters(self, src_label: str, strip_idx: int, out_label: str) -> List[str]:
+    def overlay_filters(self, src_label: str, strip_idx: int, out_label: str, gpu: bool = False) -> List[str]:
         # Both streams are re-timed by frame number so strip N always lands on frame N.
         rx, ry, _, _ = self.rect
         f = f"{self.fps:.6f}"
+        if gpu:  # main frames are yuv420p CUDA frames: upload the small strip and overlay in VRAM
+            return [
+                f"[{src_label}]setpts=N/({f}*TB)[aic_bg]",
+                f"[{strip_idx}:v]setpts=N/({f}*TB),format=yuv420p,hwupload_cuda[aic_fg]",
+                f"[aic_bg][aic_fg]overlay_cuda={rx}:{ry}:eof_action=pass[{out_label}]",
+            ]
         return [
             f"[{src_label}]setpts=N/({f}*TB)[aic_bg]",
             f"[{strip_idx}:v]setpts=N/({f}*TB)[aic_fg]",
-            f"[aic_bg][aic_fg]overlay={rx}:{ry}:eof_action=pass:format=auto[{out_label}]",
+            # format=yuv420 (not auto): source and output are yuv420p and rx/ry are even, so this avoids a
+            # full-frame pixel-format round trip; ffmpeg-only render measured 535 -> 620 fps.
+            f"[aic_bg][aic_fg]overlay={rx}:{ry}:eof_action=pass:format=yuv420[{out_label}]",
         ]
 
     def status_text(self) -> str:
         devs = ", ".join(f"{k} {v}" for k, v in self.ocr_usage.items() if v)
         ocr = f"OCR mới {self.ocr_new}" + (f" ({devs})" if devs else "") + (f", cache {self.cached_keys}" if self.cached_keys else "")
-        return f"Xóa sub AI: {self.cleaned} frame đã làm sạch · {ocr}"
+        dev = f" · tái tạo nền: {self.inpaint_device}" if self.inpaint_device else ""
+        return f"Xóa sub AI: {self.cleaned} frame đã làm sạch · {ocr}{dev}" + (f" · {self.lama_note}" if self.lama_note else "")
 
     # ---------- cache ----------
     def _load_cache(self) -> None:
@@ -482,6 +682,91 @@ class AICleanStream:
         except Exception:
             pass
 
+    # ---------- OCR pre-scan (A-Z pipeline: runs while translation / TTS wait on the network) ----------
+    def prescan(self) -> int:
+        """OCR of the sampled key frames only, saved to the same cache the render reads, so the render later
+        skips OCR (RTX 3060 1080p: 236 -> 277 fps). Decodes the video once but crops/converts/pipes only every
+        `step`-th frame. Returns the number of new samples. Full renders only (no preview limit)."""
+        if not self.cfg.auto_detect_ocr or self.limit_sec:
+            return 0
+        step = self.step
+        if self.total_frames and all(k in self.key_boxes for k in range(0, self.total_frames, step)):
+            return 0
+        rx, ry, rw, rh = self.rect
+        detectors = _get_detectors()
+        gpu = [d for d in detectors if d.device != "cpu"]
+        dets = gpu or detectors
+        cmd = [
+            self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(self.src), "-an", "-sn",
+            # n = decoded frame index = the render reader's frame index (same decoder, all frames)
+            "-vf", f"select=not(mod(n\\,{step})),crop={rw}:{rh}:{rx}:{ry}", "-fps_mode", "passthrough",
+            "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
+        ]
+        proc = _start_proc(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        q: "queue.Queue[Optional[Tuple[int, np.ndarray]]]" = queue.Queue(maxsize=64)
+        errors: List[BaseException] = []
+        new = [0]
+
+        def _worker(det) -> None:
+            batched = hasattr(det, "detect_many")
+            try:
+                while True:
+                    items = [q.get()]
+                    end = items[0] is None
+                    while batched and not end and len(items) < 16:
+                        try:
+                            it = q.get_nowait()
+                        except queue.Empty:
+                            break
+                        end = it is None
+                        if not end:
+                            items.append(it)
+                    work = [it for it in items if it is not None]
+                    if work:
+                        res = det.detect_many([s for _, s in work]) if batched else [det.detect(work[0][1])]
+                        for (k, _), boxes in zip(work, res):
+                            self.key_boxes[k] = boxes
+                        new[0] += len(work)
+                    if end:
+                        break
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=_worker, args=(d,), daemon=True) for d in dets]
+        for t in threads:
+            t.start()
+        try:
+            i = 0
+            while not errors:
+                check_cancel()
+                strip = _read_frame(proc.stdout, (rh, rw, 3))
+                if strip is None:
+                    break
+                k = i * step
+                while k not in self.key_boxes and not errors:
+                    try:
+                        q.put((k, strip), timeout=0.5)
+                        break
+                    except queue.Full:
+                        check_cancel()
+                i += 1
+        finally:
+            if errors or is_cancelled():
+                while True:  # drop pending work so the sentinels below fit
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
+            for _ in threads:
+                q.put(None)
+            for t in threads:
+                t.join()
+            _stop_proc(proc)
+            self._save_cache()
+        if errors:
+            raise RuntimeError(f"OCR quét trước lỗi: {errors[0]}")
+        return new[0]
+
     # ---------- main loop ----------
     def run(self, write: Callable[[bytes], None]) -> Dict[str, Any]:
         """Streams one cleaned BGR strip per source frame into `write`. Blocking; call from a worker thread."""
@@ -498,7 +783,6 @@ class AICleanStream:
         rx, ry, rw, rh = self.rect
         step = self.step
         key_boxes = self.key_boxes
-        strip_bytes = rw * rh * 3
         window = max(step + 1, int(self.fps * _REF_WINDOW_SEC))
         stop = threading.Event()
         errors: List[BaseException] = []
@@ -511,6 +795,9 @@ class AICleanStream:
         # ---- OCR pool ----
         detectors: List[_TextDetector] = _get_detectors() if cfg.auto_detect_ocr else []
         gpu_dets = [d for d in detectors if d.device != "cpu"]
+        # The CPU detector (4 threads, ~22 ms/sample) only joins when the GPUs fall behind. With a strong GPU
+        # (~6-10 ms/sample) that is rare, and those CPU threads are worth more to inpainting.
+        cpu_backlog = 32 if any(d.vram_mb >= 4000 for d in gpu_dets) else 6
         warm = np.zeros((rh, rw, 3), dtype=np.uint8)
         for d in detectors:
             try:
@@ -532,25 +819,47 @@ class AICleanStream:
             # DirectML busy-waits one full core per call while the GPU computes (~75 ms CPU per sample, measured).
             # Lower priority lets ffmpeg + inpainting go first; OCR runs ~20 s ahead (reader RAM buffer), so it
             # only has to keep up on average.
-            _lower_thread_priority()
+            # Strong GPU: the opposite. There the pipeline runs at 300-450 fps, so the look-ahead buffer is only
+            # ~1 s of wall time, and with 8 inpaint threads + 2 ffmpeg saturating the CPU each DirectML Run()
+            # waited for a time slice at every GPU sync point: 6-9 ms idle -> 112 ms under load (main loop then
+            # waited 7.9 s of an 11 s render). The thread mostly sleeps on the GPU, so HIGHEST costs little CPU.
+            if det.device != "cpu" and det.vram_mb >= 4000:
+                _set_thread_priority(2)  # THREAD_PRIORITY_HIGHEST
+            else:
+                _lower_thread_priority()
+            batched = hasattr(det, "detect_many")
             try:
                 while not stop.is_set():
-                    if lazy_cpu and ocr_q.qsize() < 6:
+                    if lazy_cpu and ocr_q.qsize() < cpu_backlog:
                         time.sleep(0.02)
                         continue
                     try:
-                        _, _, kind, k, roi = ocr_q.get(timeout=0.2)
+                        items = [ocr_q.get(timeout=0.2)]
                     except queue.Empty:
                         continue
-                    if kind is None:
+                    # batched detector (CUDA): take whatever else is queued, one forward pass for all
+                    end = items[0][2] is None
+                    while batched and not end and len(items) < 16:
+                        try:
+                            it = ocr_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        if it[2] is None:
+                            end = True
+                        else:
+                            items.append(it)
+                    work = [it for it in items if it[2] is not None]
+                    if work:
+                        res = det.detect_many([it[4] for it in work]) if batched else [det.detect(work[0][4])]
+                        for (_, _, kind, k, _), boxes in zip(work, res):
+                            if kind == "key":
+                                key_boxes[k] = boxes
+                            else:
+                                probe_res[k] = boxes is not None
+                            self.ocr_new += 1
+                        self.ocr_usage[det.label] = det.count - start_counts[det.label]
+                    if end:
                         break
-                    boxes = det.detect(roi)
-                    if kind == "key":
-                        key_boxes[k] = boxes
-                    else:
-                        probe_res[k] = boxes is not None
-                    self.ocr_new += 1
-                    self.ocr_usage[det.label] = det.count - start_counts[det.label]
             except BaseException as e:  # noqa: BLE001
                 errors.append(e)
                 stop.set()
@@ -560,22 +869,38 @@ class AICleanStream:
             t.start()
 
         # ---- reader (decode ROI strips) ----
-        reader = _start_proc(_roi_reader_cmd(self.ffmpeg, self.src, self.rect, self.limit_sec),
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         r_err: List[bytes] = []
-        _drain_stderr(reader, r_err)
+        reader: Optional[subprocess.Popen] = None
+        if self._source is None:
+            reader = _start_proc(_roi_reader_cmd(self.ffmpeg, self.src, self.rect, self.limit_sec),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _drain_stderr(reader, r_err)
+
+            def _next_strip() -> Optional[np.ndarray]:
+                return _read_frame(reader.stdout, (rh, rw, 3))
+        else:
+            src_q = self._source
+
+            def _next_strip() -> Optional[np.ndarray]:
+                while not stop.is_set():
+                    try:
+                        return src_q.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                return None
         in_q: "queue.Queue[Optional[np.ndarray]]" = queue.Queue(maxsize=512)   # RAM buffer
         n_read = [0]
+        read_pos = [0]  # live: frames [0, read_pos) are in strip_store (or already written)
 
         def _reader_thread():
             try:
                 idx = 0
                 while not stop.is_set():
-                    raw = _read_exact(reader.stdout, strip_bytes)
-                    if raw is None:
+                    strip = _next_strip()
+                    if strip is None:
                         break
-                    strip = np.frombuffer(raw, dtype=np.uint8).reshape(rh, rw, 3)
                     strip_store[idx] = strip
+                    read_pos[0] = idx + 1
                     if idx % step == 0 and idx not in key_boxes:
                         ocr_q.put((1, next(seq), "key", idx, strip))
                     while not stop.is_set():
@@ -601,7 +926,7 @@ class AICleanStream:
                     if item is None:
                         break
                     arr = item.result() if hasattr(item, "result") else item
-                    write(arr.tobytes())
+                    write(np.ascontiguousarray(arr).data)  # buffer protocol: no tobytes() copy
                     self.written += 1
             except BaseException as e:  # noqa: BLE001
                 errors.append(e)
@@ -665,7 +990,15 @@ class AICleanStream:
                 return mask_cache[used]
             m = np.zeros((rh, rw), dtype=np.uint8)
             for k in used:
-                cv2.fillPoly(m, list(key_boxes[k]), 255)
+                if self.text_logo:
+                    for poly in key_boxes[k]:
+                        x0, y0 = poly[:, 0].min(), poly[:, 1].min()
+                        x1, y1 = poly[:, 0].max(), poly[:, 1].max()
+                        th = max(4, int(y1 - y0))
+                        px, py = int(0.45 * th) + 2, int(0.12 * th) + 2
+                        cv2.rectangle(m, (max(0, x0 - px), max(0, y0 - py)), (min(rw - 1, x1 + px), min(rh - 1, y1 + py)), 255, -1)
+                else:
+                    cv2.fillPoly(m, list(key_boxes[k]), 255)
             m = cv2.dilate(m, kernel, iterations=1)
             if len(mask_cache) > 256:
                 mask_cache.clear()
@@ -748,7 +1081,10 @@ class AICleanStream:
             try:
                 while not stop.is_set():
                     busy = False
-                    while nxt in key_boxes and (nxt + step) in key_boxes:
+                    # Wait until the reader has the strips up to k1: with OCR keys from the cache / pre-scan
+                    # the keys are known long before the frames, and a glyph test without the strips fell
+                    # back to the "union" (both subtitles smeared over every in-between frame).
+                    while nxt in key_boxes and (nxt + step) in key_boxes and nxt + step < read_pos[0]:
                         k0, k1 = nxt, nxt + step
                         if _needs_ivl(k0, k1) and k0 not in ivl:
                             codes = _glyph_codes(k0, k1)
@@ -800,7 +1136,16 @@ class AICleanStream:
         reader_eof = False
         last_clean: Optional[Tuple[int, np.ndarray]] = None
         processed = 0
-        pool = ThreadPoolExecutor(max_workers=4)
+        # Inpainting was THE bottleneck with a fixed 4 threads (228 fps on a 6C/12T i5-12400F vs 447 fps with 8).
+        # NVIDIA >= 4 GB + torch CUDA: whole chunks are reconstructed on the GPU instead (gpu_inpaint.py).
+        gpu_inp = None
+        if self.lama is None:
+            from app.services.gpu_inpaint import get_gpu_inpainter
+
+            gpu_inp = get_gpu_inpainter()
+        self.inpaint_device = f"GPU {gpu_inp.name}" if gpu_inp is not None else f"CPU {self.inpaint_workers} luồng"
+        gpu_pool = ThreadPoolExecutor(max_workers=1) if gpu_inp is not None else None
+        pool = ThreadPoolExecutor(max_workers=self.inpaint_workers if gpu_inp is None else 1)
 
         def _fill():
             nonlocal reader_eof
@@ -858,7 +1203,17 @@ class AICleanStream:
                 for i in range(n):
                     if jobs[i] is None:
                         last_clean = buf[i]
-                futures = [pool.submit(_inpaint_text_region, j[0], j[1], j[2], self.lama) if j else None for j in jobs]
+                if gpu_inp is not None:
+                    # whole chunk in one GPU call; each frame's "future" is a slice of the chunk result
+                    futures: List[Any] = [None] * n
+                    idx = [i for i in range(n) if jobs[i] is not None]
+                    if idx:
+                        cf = gpu_pool.submit(gpu_inp.process, [jobs[i][0] for i in idx],
+                                             [jobs[i][1] for i in idx], [jobs[i][2] for i in idx])
+                        for k, i in enumerate(idx):
+                            futures[i] = _ChunkItem(cf, k)
+                else:
+                    futures = [pool.submit(_inpaint_text_region, j[0], j[1], j[2], self.lama) if j else None for j in jobs]
                 for i in range(n):
                     f_i, strip = buf.popleft()
                     strip_store.pop(f_i, None)
@@ -878,6 +1233,8 @@ class AICleanStream:
         finally:
             stop.set()
             pool.shutdown(wait=False, cancel_futures=True)
+            if gpu_pool is not None:
+                gpu_pool.shutdown(wait=False, cancel_futures=True)
             for _ in ocr_threads:
                 ocr_q.put((99, next(seq), None, 0, None))
             try:
@@ -906,9 +1263,241 @@ class AICleanStream:
 # ----------------------------------------------------------------------------------------------------
 
 
+# ----------------------------------------------------------------------------------------------------
+# Several regions (subtitle box + text-logo / watermark boxes) from ONE decode
+# ----------------------------------------------------------------------------------------------------
+
+
+def ai_clean_regions(project: VideoProject) -> List[Tuple[BoxRect, bool]]:
+    """Every region the AI cleaner must process, as (box, is_text_logo): the subtitle box (mode ai_clean) +
+    the text-logo / watermark boxes (wm_removal enabled, mode ai_clean)."""
+    cfg = project.config
+    regions: List[Tuple[BoxRect, bool]] = []
+    if cfg.sub_removal.mode == "ai_clean":
+        regions.append((cfg.sub_removal.box, False))
+    wm = getattr(cfg, "wm_removal", None)
+    if wm is not None and wm.enabled and wm.mode == "ai_clean":
+        regions.extend((b, True) for b in wm.boxes)
+    return regions
+
+
+def ai_clean_boxes(project: VideoProject) -> List[BoxRect]:
+    return [b for b, _ in ai_clean_regions(project)]
+
+
+class MultiCleanStream:
+    """N AICleanStreams fed by ONE ffmpeg decode: the reader crops every region (converted to BGR per region,
+    so colours at a region's edge never mix with its neighbour), pads them to the same width and stacks them
+    vertically; a distributor thread slices each frame back into the regions' queues. The cleaned regions are
+    re-stacked into one strip per frame for the render ffmpeg, which crops and overlays each at its place.
+    (One decode instead of one per region: an extra region costs OCR + inpainting only.)"""
+
+    def __init__(self, project: VideoProject, preview_seconds: Optional[float], regions: List[Tuple[BoxRect, bool]]) -> None:
+        self.queues: List[queue.Queue] = [queue.Queue(maxsize=64) for _ in regions]
+        self.streams = [
+            AICleanStream(project, preview_seconds, box=b, source=q, text_logo=tl)
+            for (b, tl), q in zip(regions, self.queues)
+        ]
+        s0 = self.streams[0]
+        self.fps, self.limit_sec, self.total_frames = s0.fps, s0.limit_sec, s0.total_frames
+        self.src, self.ffmpeg = s0.src, s0.ffmpeg
+        self.width = max(s.rect[2] for s in self.streams)
+        self.offsets: List[int] = []
+        y = 0
+        for st in self.streams:
+            self.offsets.append(y)
+            y += st.rect[3]
+        self.height = y
+        self.error: Optional[BaseException] = None
+
+    @property
+    def written(self) -> int:
+        return min(st.written for st in self.streams)
+
+    def status_text(self) -> str:
+        cleaned = sum(st.cleaned for st in self.streams)
+        ocr = sum(st.ocr_new for st in self.streams)
+        cached = sum(st.cached_keys for st in self.streams)
+        dev = self.streams[0].inpaint_device
+        return (
+            f"Xóa sub + chữ logo AI ({len(self.streams)} vùng): {cleaned} lượt làm sạch · OCR mới {ocr}"
+            + (f", cache {cached}" if cached else "") + (f" · tái tạo nền: {dev}" if dev else "")
+        )
+
+    def ffmpeg_input_args(self) -> List[str]:
+        return ["-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{self.width}x{self.height}",
+                "-framerate", f"{self.fps:.6f}", "-i", "pipe:0"]
+
+    def overlay_filters(self, src_label: str, strip_idx: int, out_label: str, gpu: bool = False) -> List[str]:
+        f = f"{self.fps:.6f}"
+        n = len(self.streams)
+        flt = [
+            f"[{src_label}]setpts=N/({f}*TB)[mc_bg0]",
+            f"[{strip_idx}:v]setpts=N/({f}*TB),split={n}" + "".join(f"[mc_s{i}]" for i in range(n)),
+        ]
+        cur = "mc_bg0"
+        for i, st in enumerate(self.streams):
+            rx, ry, rw, rh = st.rect
+            chain = f"[mc_s{i}]crop={rw}:{rh}:0:{self.offsets[i]}"
+            chain += ",format=yuv420p,hwupload_cuda" if gpu else ""
+            flt.append(f"{chain}[mc_c{i}]")
+            nxt = out_label if i == n - 1 else f"mc_bg{i + 1}"
+            if gpu:
+                flt.append(f"[{cur}][mc_c{i}]overlay_cuda={rx}:{ry}:eof_action=pass[{nxt}]")
+            else:
+                flt.append(f"[{cur}][mc_c{i}]overlay={rx}:{ry}:eof_action=pass:format=yuv420[{nxt}]")
+            cur = nxt
+        return flt
+
+    def _reader_cmd(self) -> List[str]:
+        n = len(self.streams)
+        parts = [f"[0:v]split={n}" + "".join(f"[a{i}]" for i in range(n))]
+        for i, st in enumerate(self.streams):
+            rx, ry, rw, rh = st.rect
+            parts.append(f"[a{i}]crop={rw}:{rh}:{rx}:{ry},format=bgr24,pad={self.width}:{rh}:0:0:black[p{i}]")
+        parts.append("".join(f"[p{i}]" for i in range(n)) + f"vstack=inputs={n}[o]")
+        return [
+            self.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+            *(["-t", f"{self.limit_sec:.3f}"] if self.limit_sec else []), "-i", str(self.src), "-an", "-sn",
+            "-filter_complex", ";".join(parts), "-map", "[o]", "-fps_mode", "passthrough",
+            "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1",
+        ]
+
+    def prescan(self) -> int:
+        return sum(st.prescan() for st in self.streams)
+
+    def run(self, write: Callable[[Any], None]) -> Dict[str, Any]:
+        n = len(self.streams)
+        stop = threading.Event()
+        errors: List[BaseException] = []
+        outs: List[queue.Queue] = [queue.Queue(maxsize=64) for _ in range(n)]
+        results: List[Dict[str, Any]] = [{} for _ in range(n)]
+        reader = _start_proc(self._reader_cmd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        r_err: List[bytes] = []
+        _drain_stderr(reader, r_err)
+
+        def _put(q: queue.Queue, item) -> bool:
+            while not stop.is_set():
+                try:
+                    q.put(item, timeout=0.5)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def _distribute() -> None:
+            try:
+                while not stop.is_set():
+                    frame = _read_frame(reader.stdout, (self.height, self.width, 3))
+                    if frame is None:
+                        break
+                    for i, st in enumerate(self.streams):
+                        _, _, rw, rh = st.rect
+                        y0 = self.offsets[i]
+                        if not _put(self.queues[i], np.ascontiguousarray(frame[y0 : y0 + rh, :rw])):
+                            return
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+            finally:
+                for q in self.queues:
+                    try:
+                        q.put(None, timeout=5)
+                    except queue.Full:
+                        pass
+
+        def _stream(i: int) -> None:
+            st = self.streams[i]
+            _, _, rw, rh = st.rect
+
+            def _w(buf) -> None:
+                arr = np.frombuffer(buf, dtype=np.uint8).reshape(rh, rw, 3).copy()
+                if not _put(outs[i], arr):
+                    raise RuntimeError("đã dừng")
+
+            try:
+                results[i] = st.run(_w)
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+                stop.set()
+            finally:
+                try:
+                    outs[i].put(None, timeout=5)
+                except queue.Full:
+                    pass
+
+        threads = [threading.Thread(target=contextvars.copy_context().run, args=(_distribute,), daemon=True)]
+        threads += [threading.Thread(target=contextvars.copy_context().run, args=(_stream, i), daemon=True) for i in range(n)]
+        for t in threads:
+            t.start()
+        frames = 0
+        try:
+            while True:
+                check_cancel()
+                if errors:
+                    raise RuntimeError(f"AI xóa sub / chữ logo lỗi: {errors[0]}") from errors[0]
+                parts = []
+                for q in outs:
+                    item = None
+                    while not stop.is_set():
+                        try:
+                            item = q.get(timeout=0.5)
+                            break
+                        except queue.Empty:
+                            check_cancel()
+                            if errors:
+                                break
+                    parts.append(item)
+                if errors:
+                    continue
+                if any(p is None for p in parts):
+                    break
+                stacked = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+                for i, arr in enumerate(parts):
+                    y0 = self.offsets[i]
+                    stacked[y0 : y0 + arr.shape[0], : arr.shape[1]] = arr
+                write(stacked.data)
+                frames += 1
+        except BaseException as e:  # noqa: BLE001
+            self.error = e
+            raise
+        finally:
+            stop.set()
+            _stop_proc(reader)
+            for q in self.queues:
+                try:
+                    q.put_nowait(None)
+                except queue.Full:
+                    pass
+        if frames == 0:
+            raise RuntimeError("Không đọc được frame nào: " + b"".join(r_err).decode("utf-8", "replace")[-300:])
+        merged: Dict[str, Any] = {"frames": frames, "regions": n}
+        for key in ("cleaned_frames", "ocr_new", "ocr_cached"):
+            merged[key] = sum(int(r.get(key, 0) or 0) for r in results)
+        merged["ocr_wait_sec"] = round(max(float(r.get("ocr_wait_sec", 0) or 0) for r in results), 1)
+        merged["per_region"] = results
+        return merged
+
+
+def make_clean_stream(project: VideoProject, preview_seconds: Optional[float] = None):
+    """The AI cleaner for this project: None (no AI region), one AICleanStream (single region: unchanged
+    path) or a MultiCleanStream (subtitle + text-logo / watermark regions, one shared decode)."""
+    regions = ai_clean_regions(project)
+    if not regions:
+        return None
+    if len(regions) == 1:
+        return AICleanStream(project, preview_seconds, box=regions[0][0], text_logo=regions[0][1])
+    return MultiCleanStream(project, preview_seconds, regions)
+
+
+def prescan_ocr_sync(project: VideoProject) -> int:
+    """Fills the OCR cache of every AI region for a full render of `project` (see AICleanStream.prescan)."""
+    st = make_clean_stream(project)
+    return st.prescan() if st is not None else 0
+
+
 def _encoder_args(enc: str) -> List[str]:
     if enc == "h264_nvenc":
-        return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "18", "-pix_fmt", "yuv420p"]
+        return ["-c:v", "h264_nvenc", "-preset", "p2", "-cq", "18", "-pix_fmt", "yuv420p"]
     if enc == "h264_qsv":
         return ["-c:v", "h264_qsv", "-preset", "faster", "-global_quality", "19", "-pix_fmt", "nv12"]
     return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
@@ -965,6 +1554,7 @@ def clean_hardsub_video_sync(
     if ret != 0:
         raise RuntimeError(f"AI Clean Sub xuất video lỗi: {b''.join(err).decode('utf-8', 'replace')[-400:]}")
     stats = {**result, "total_frames": result.get("frames", 0), "encoder": enc,
+             "untouched_frames": result.get("frames", 0) - result.get("cleaned_frames", 0),
              "seconds": round(time.time() - t0, 1), "out_video": str(out_video)}
     if on_progress:
         on_progress(100.0, f"Xóa sub sạch xong! {stream.status_text()}")

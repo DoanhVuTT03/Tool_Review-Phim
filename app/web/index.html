@@ -57,6 +57,8 @@
           <button class="chip" data-layer="logo">Logo kênh</button>
           <button class="chip" data-layer="greenscreen">Like/Sub nền xanh</button>
           <button class="chip" data-layer="subremoval">Xóa sub / Mờ</button>
+          <button class="chip" data-layer="wm">Xóa chữ logo</button>
+          <button class="chip" data-layer="channel">Tên kênh</button>
         </div>
         <div id="stage-meta" style="font-size:11.5px;color:var(--text-2);">Chưa chọn video</div>
       </div>
@@ -107,6 +109,18 @@
             <span class="ov-label">Video Nền Xanh (kéo W×H tự do)</span>
             <canvas id="ov-gs-canvas"></canvas>
             <video id="gs-source-video" class="hidden" muted playsinline></video>
+            <div class="handle nw" data-dir="nw"></div><div class="handle n" data-dir="n"></div><div class="handle ne" data-dir="ne"></div>
+            <div class="handle w" data-dir="w"></div><div class="handle e" data-dir="e"></div>
+            <div class="handle sw" data-dir="sw"></div><div class="handle s" data-dir="s"></div><div class="handle se" data-dir="se"></div>
+          </div>
+
+          <!-- Overlay 5: text-logo / watermark regions (dynamic, one box per region) -->
+          <div id="ov-wm-container"></div>
+
+          <!-- Overlay 6: channel name text -->
+          <div id="ov-channel" class="ov-box hidden" data-layer="channel">
+            <span class="ov-label">Tên Kênh</span>
+            <div id="ov-channel-inner"></div>
             <div class="handle nw" data-dir="nw"></div><div class="handle n" data-dir="n"></div><div class="handle ne" data-dir="ne"></div>
             <div class="handle w" data-dir="w"></div><div class="handle e" data-dir="e"></div>
             <div class="handle sw" data-dir="sw"></div><div class="handle s" data-dir="s"></div><div class="handle se" data-dir="se"></div>
@@ -211,6 +225,26 @@
                   <option value="left">Trái</option>
                   <option value="right">Phải</option>
                 </select>
+              </div>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Hiệu ứng phụ đề</label>
+                <select id="sub-effect" title="Hiệu ứng xuất hiện của mỗi câu phụ đề (+ mờ dần khi hết câu). Xem trước ngay trên video khi bấm Phát.">
+                  <option value="none">Không hiệu ứng</option>
+                  <option value="fade">Mờ dần vào / ra</option>
+                  <option value="slide_up">Trượt lên</option>
+                  <option value="pop">Bật nảy (Pop)</option>
+                  <option value="zoom_in">Phóng to vào</option>
+                  <option value="typewriter">Gõ chữ (lộ dần trái → phải)</option>
+                  <option value="blur_in">Nhòe → nét</option>
+                  <option value="bounce">Rơi nảy</option>
+                  <option value="slide_left">Trượt từ phải sang</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Thời gian hiệu ứng <span id="val-sub-fx-dur">0.30s</span></label>
+                <input id="sub-effect-dur" type="range" min="0.15" max="1" step="0.05" value="0.3" />
               </div>
             </div>
             <div class="field">
@@ -346,8 +380,8 @@
               <div class="field">
                 <label>Chế độ AI tái tạo nền</label>
                 <select id="sr-ai-engine">
-                  <option value="sttn">Temporal Propagation + Mask Sạch (Nhanh & Nét)</option>
-                  <option value="lama">LaMa ONNX (nếu có model data/models/lama_fp32.onnx)</option>
+                  <option value="sttn">Temporal Propagation + Mask Sạch (Nhanh & Nét — khuyên dùng)</option>
+                  <option value="lama">LaMa ONNX (cần data/models/lama_fp32.onnx + GPU CUDA; rất chậm ~150ms/frame; không chạy được trên DirectML → tự dùng chế độ nhanh)</option>
                 </select>
               </div>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin-bottom:6px;cursor:pointer;">
@@ -364,6 +398,107 @@
               </div>
               <div class="hint-box">
                 Kéo khung xanh trên Preview để khoanh vùng chứa sub gốc. Các frame không có chữ sẽ giữ nguyên 100% pixel gốc!
+              </div>
+            </div>
+          </div>
+
+          <!-- TEXT LOGO / WATERMARK REMOVAL -->
+          <div class="card">
+            <div class="card-head">
+              <span>Xóa Chữ Logo / Watermark</span>
+              <label style="display:flex;align-items:center;gap:5px;font-size:11.5px;cursor:pointer;">
+                <input id="wm-enabled" type="checkbox" /> Bật
+              </label>
+            </div>
+            <div class="field">
+              <label>Cách xử lý</label>
+              <select id="wm-mode">
+                <option value="ai_clean">AI quét &amp; xóa sạch chữ (OCR dò chữ + tái tạo nền)</option>
+                <option value="blur">Làm mờ cả khung</option>
+              </select>
+            </div>
+            <div id="wm-blur-opts" class="field hidden">
+              <label>Độ mờ <span id="val-wm-blur">24</span></label>
+              <input id="wm-blur" type="range" min="4" max="60" value="24" />
+            </div>
+            <div id="wm-list" class="wm-list"></div>
+            <button id="btn-wm-add" class="btn btn-sm" style="width:100%;">+ Thêm vùng chữ logo</button>
+            <div class="hint-box" style="margin-top:8px;">
+              Chọn lớp <b>Xóa chữ logo</b> rồi kéo từng khung đỏ phủ trọn chữ logo / watermark (vd. "本作品含AI生成内容" ở góc).
+              Có bao nhiêu chỗ thì thêm bấy nhiêu khung. AI tự dò chữ trong từng khung và chỉ xóa ở frame có chữ.
+            </div>
+          </div>
+
+          <!-- CHANNEL NAME TEXT -->
+          <div class="card">
+            <div class="card-head">
+              <span>Chữ Tên Kênh</span>
+              <label style="display:flex;align-items:center;gap:5px;font-size:11.5px;cursor:pointer;">
+                <input id="ch-enabled" type="checkbox" /> Bật
+              </label>
+            </div>
+            <div class="field">
+              <label>Nội dung</label>
+              <input id="ch-text" type="text" placeholder="Ví dụ: REVIEW PHIM HAY" />
+            </div>
+            <div class="field">
+              <label>Font chữ</label>
+              <select id="ch-font"></select>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Cỡ chữ <span id="val-ch-size">40px</span></label>
+                <input id="ch-size" type="range" min="12" max="140" value="40" />
+              </div>
+              <div class="field">
+                <label>Viền chữ <span id="val-ch-outline">2px</span></label>
+                <input id="ch-outline" type="range" min="0" max="10" value="2" />
+              </div>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Màu chữ</label>
+                <input id="ch-color" type="color" value="#ffffff" />
+              </div>
+              <div class="field">
+                <label>Màu viền</label>
+                <input id="ch-outline-color" type="color" value="#000000" />
+              </div>
+            </div>
+            <div class="row-2" style="margin-bottom:6px;">
+              <label style="display:flex;align-items:center;gap:5px;font-size:11.5px;cursor:pointer;"><input id="ch-bg-enabled" type="checkbox" checked /> Nền khung</label>
+              <label style="display:flex;align-items:center;gap:5px;font-size:11.5px;cursor:pointer;"><input id="ch-bold" type="checkbox" checked /> Chữ đậm</label>
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Màu nền</label>
+                <input id="ch-bg-color" type="color" value="#e11d48" />
+              </div>
+              <div class="field">
+                <label>Độ mờ nền <span id="val-ch-bg-op">85%</span></label>
+                <input id="ch-bg-opacity" type="range" min="0" max="1" step="0.02" value="0.85" />
+              </div>
+            </div>
+            <div class="field">
+              <label>Bo góc <span id="val-ch-radius">14px</span></label>
+              <input id="ch-radius" type="range" min="0" max="60" value="14" />
+            </div>
+            <div class="row-2">
+              <div class="field">
+                <label>Hiệu ứng</label>
+                <select id="ch-effect">
+                  <option value="none">Không hiệu ứng</option>
+                  <option value="breathe">Nhịp thở (phóng to / thu nhỏ)</option>
+                  <option value="float">Bồng bềnh (lên xuống)</option>
+                  <option value="pulse">Nhấp nháy mờ</option>
+                  <option value="shimmer">Ánh sáng lướt qua (định kỳ)</option>
+                  <option value="slide_in">Trượt vào (định kỳ)</option>
+                  <option value="typewriter">Gõ chữ (định kỳ)</option>
+                </select>
+              </div>
+              <div id="ch-period-field" class="field">
+                <label>Lặp lại mỗi (giây)</label>
+                <input id="ch-period" type="number" min="2" max="120" step="1" value="8" />
               </div>
             </div>
           </div>
@@ -444,9 +579,10 @@
                 <select id="tr-provider">
                   <option value="antigravity">Antigravity (SDK / CLI)</option>
                   <option value="gemini_api">Gemini API Trực tiếp</option>
+                  <option value="gemini_web">Gemini Web (gemini.google.com — không cần key)</option>
                 </select>
               </div>
-              <div class="field">
+              <div id="tr-thinking-field" class="field">
                 <label>Cấp độ tư duy</label>
                 <select id="tr-thinking">
                   <option value="minimal">Minimal (Rất nhanh)</option>
@@ -457,25 +593,71 @@
                 </select>
               </div>
             </div>
-            <div class="field">
+            <div id="tr-model-resolved" class="model-resolved"></div>
+            <div id="tr-model-field" class="field">
               <label>Model Antigravity (Mới nhất)</label>
               <select id="tr-model"></select>
             </div>
-            <div class="row-2">
-              <div class="field">
-                <label>Số dòng mỗi lô (Batch)</label>
-                <input id="tr-batch" type="number" min="10" max="120" value="45" />
+            <div id="tr-web-box" class="hint-box hidden" style="margin-bottom:8px;">
+              <div style="font-weight:600;margin-bottom:6px;">🌐 Gemini Web — gửi lần lượt từng phần, kiểm tra đủ dòng</div>
+              <div class="row-2">
+                <div class="field">
+                  <label>Cách gửi</label>
+                  <select id="tr-web-mode">
+                    <option value="manual">Thủ công — tool đưa prompt, tôi tự gửi &amp; dán kết quả</option>
+                    <option value="auto">Tự động A–Z — tool tự gửi trong cửa sổ Chrome riêng</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label>Tối đa số dòng mỗi phần</label>
+                  <input id="tr-web-chunk" type="number" min="20" max="3000" value="250" title="File ít dòng hơn số này: gửi nguyên 1 phần. File dài hơn: chia thành các phần BẰNG NHAU, mỗi phần không quá số này. Gemini web hay dịch ẩu / bỏ dòng khi gửi quá nhiều: 150–300 là hợp lý." />
+                </div>
               </div>
-              <div class="field">
+              <div id="tr-web-plan" style="font-size:12px;color:var(--text-2);margin:2px 0 6px;"></div>
+              <div id="tr-web-auto-row">
+                <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin:2px 0 6px;cursor:pointer;">
+                  <input id="tr-web-newchat" type="checkbox" checked />
+                  <span>Mở chat mới cho mỗi phần (tránh Gemini lẫn ngữ cảnh / dịch lặp)</span>
+                </label>
+                <div class="row-2">
+                  <button id="btn-web-open" class="btn btn-sm" title="Mở cửa sổ Chrome riêng của tool. Lần đầu: đăng nhập Google trong cửa sổ đó (chỉ 1 lần, tool nhớ). Không đụng tới Chrome bạn đang dùng.">🌐 Mở Chrome Gemini</button>
+                  <button id="btn-web-check" class="btn btn-sm">Kiểm tra kết nối</button>
+                </div>
+                <div id="tr-web-status" style="font-size:12px;margin-top:6px;color:var(--text-2);">Chế độ tự động: lần đầu bấm "Mở Chrome Gemini" và đăng nhập Google trong cửa sổ đó. Chọn model (Nhanh / Tư duy / Pro) ngay trên Gemini.</div>
+              </div>
+              <div style="font-size:11px;color:var(--text-2);margin-top:6px;">Mỗi câu trả lời được kiểm tra: đủ dòng, không thừa, không lặp, không còn chữ gốc. Sai → không nhận, báo dịch lại. Tiến trình lưu theo từng phần.</div>
+            </div>
+            <label style="display:flex;align-items:flex-start;gap:6px;font-size:12px;margin:2px 0 8px;cursor:pointer;" title="Antigravity đọc cả file SRT và tự ghi bản dịch trong MỘT cuộc chat: cùng một ngữ cảnh cho cả phim nên tên nhân vật / xưng hô nhất quán nhất. Tool kiểm tra đủ 100% dòng; dòng nào thiếu hoặc còn chữ gốc sẽ tự dịch bù theo lô. Phim 8 tiếng ~25 phút. Cần app Antigravity (không dùng API Key).">
+              <input id="tr-whole-file" type="checkbox" style="margin-top:2px;" />
+              <span><b>Dịch cả file trong 1 chat</b> (Antigravity tự đọc &amp; ghi file — nhất quán nhất; dòng thiếu tự dịch bù theo lô)</span>
+            </label>
+            <label style="display:flex;align-items:flex-start;gap:6px;font-size:12px;margin:2px 0 6px;cursor:pointer;" title="Mỗi dòng gửi AI kèm SỐ ÂM TIẾT TỐI ĐA tính từ thời lượng câu đó trên video và tốc độ đọc của ngôn ngữ đích. Dịch xong, câu nào vẫn quá dài được AI rút gọn. Không bật: câu tiếng Trung rất ngắn dịch ra dài gấp đôi → voice bị tua nhanh, đọc dồn sang câu sau.">
+              <input id="tr-fit-timing" type="checkbox" checked style="margin-top:2px;" />
+              <span><b>⏱ Ép câu dịch vừa khung thời gian</b> (chống voice tua nhanh / đọc dồn — mọi ngôn ngữ)</span>
+            </label>
+            <div class="fit-row">
+              <span id="tr-length-report" class="fit-report">Độ dài bản dịch: chưa kiểm tra</span>
+              <button id="btn-fit-length" class="btn btn-sm" title="Tìm các câu đã dịch quá dài so với thời lượng trên video và nhờ AI rút gọn (giữ ý chính, tên riêng). Sau đó bấm Tạo voice: chỉ các câu đã đổi được đọc lại.">✂ Rút gọn câu tràn khung</button>
+            </div>
+            <div id="tr-whole-note" class="hint-box hidden" style="margin-bottom:8px;">
+              Chế độ cả file: 1 chat Antigravity dịch toàn bộ phim. Dòng nào chat bỏ sót (hiếm) sẽ được tool tự dịch bù —
+              không cần chỉnh Batch / số luồng.
+            </div>
+            <div class="row-2">
+              <div id="tr-batch-field" class="field">
+                <label id="tr-batch-label">Số dòng mỗi lô (Batch)</label>
+                <input id="tr-batch" type="number" min="10" max="2000" value="45" title="Số dòng gửi dịch mỗi lần (10–2000). Lô lớn được gửi cho Antigravity dưới dạng file để nó tự đọc." />
+              </div>
+              <div id="tr-tol-field" class="field">
                 <label>Độ chênh độ dài (%)</label>
                 <input id="tr-tol" type="number" min="5" max="50" value="15" />
               </div>
             </div>
-            <div class="field">
+            <div id="tr-conc-field" class="field">
               <label>Số luồng dịch song song (1–16)</label>
               <input id="tr-concurrency" type="number" min="1" max="16" value="4" title="Số lô SRT gửi dịch cùng lúc. Nhiều luồng = nhanh hơn, nhưng dễ bị giới hạn tốc độ (rate limit). Khuyên dùng 3–6." />
             </div>
-            <div class="field">
+            <div id="tr-apikey-field" class="field">
               <label>API Key (tùy chọn nếu Antigravity cần key ngoài)</label>
               <input id="tr-api-key" type="password" placeholder="Để trống nếu đã đăng nhập Antigravity/ENV..." />
             </div>
@@ -485,7 +667,10 @@
             </div>
             <div style="margin-top:6px;display:flex;justify-content:space-between;align-items:center;">
               <span id="tr-checkpoint-info" style="font-size:11px;color:var(--text-2);">Checkpoint: Chưa dịch</span>
-              <button id="btn-translate-reset" class="btn btn-sm btn-danger" title="Xóa checkpoint cũ và dịch lại từ dòng 1">Dịch lại từ đầu</button>
+              <span style="display:flex;gap:6px;">
+                <button id="btn-translate-clear" class="btn btn-sm" title="Chỉ xóa tiến trình đã dịch (lần dịch sau bắt đầu từ dòng 1), KHÔNG chạy dịch. Style Guide và file SRT đã dịch được giữ, trừ khi bạn chọn xóa cả Style Guide.">🗑 Xóa tiến trình</button>
+                <button id="btn-translate-reset" class="btn btn-sm btn-danger" title="Xóa checkpoint cũ và dịch lại từ dòng 1">Dịch lại từ đầu</button>
+              </span>
             </div>
           </div>
 
@@ -506,8 +691,21 @@
                   <option value="low" selected>Low (Nhanh)</option>
                   <option value="medium">Medium</option>
                   <option value="high">High</option>
+                  <option value="xhigh">Extra High</option>
                 </select>
               </div>
+            </div>
+            <div id="clean-model-resolved" class="model-resolved"></div>
+            <div class="field">
+              <label title="AI chỉ trả về các dòng cần xóa/sửa nên gửi nhiều dòng 1 lần vẫn nhanh. Tự động: chia ~1500 dòng/lần, 6 lần song song (8 tiếng phim ~4 phút, sửa kỹ hơn). Cả file 1 lần: Antigravity tự đọc cả file trong 1 chat (10 940 dòng ~4 phút).">Số dòng mỗi lần gửi AI</label>
+              <select id="clean-srt-batch" title="AI chỉ trả về các dòng cần xóa/sửa nên gửi nhiều dòng 1 lần vẫn nhanh. Tự động: chia ~1500 dòng/lần, 6 lần song song (8 tiếng phim ~4 phút, sửa kỹ hơn). Cả file 1 lần: Antigravity tự đọc cả file trong 1 chat (10 940 dòng ~4 phút).">
+                  <option value="0" selected>Tự động — nhồi tối đa mỗi lần (ít lần gửi nhất)</option>
+                  <option value="300">300 dòng / lần</option>
+                  <option value="500">500 dòng / lần</option>
+                  <option value="1000">1000 dòng / lần</option>
+                  <option value="2000">2000 dòng / lần</option>
+                  <option value="100000">Cả file 1 lần (Antigravity tự đọc file — 1 chat duy nhất)</option>
+              </select>
             </div>
             <div class="row-2">
               <button id="btn-clean-srt-rules" class="btn btn-sm">Lọc nhanh (Không AI)</button>
@@ -547,6 +745,7 @@
                   <option value="capcut_tiktok">CapCut / TikTok (Free)</option>
                   <option value="edge_tts">Edge-TTS Neural (318 + Multilingual)</option>
                   <option value="gtts">Google TTS Free (Có Tagalog/PH)</option>
+                  <option value="higgs3">Higgs TTS 3 — Clone giọng mẫu (GPU 12GB, WSL)</option>
                 </select>
               </div>
               <div class="field">
@@ -554,6 +753,7 @@
                 <select id="voice-lang"></select>
               </div>
             </div>
+            <div id="voice-std-box">
             <label style="display:flex;align-items:center;gap:6px;font-size:11.5px;margin-bottom:8px;cursor:pointer;">
               <input id="voice-include-multi" type="checkbox" checked /> ⭐ Hiện giọng nâng cấp Đa ngôn ngữ (Multilingual — như Clipchamp)
             </label>
@@ -574,8 +774,8 @@
                 <input id="voice-speed" type="range" min="0.7" max="1.5" step="0.05" value="1.0" />
               </div>
               <div class="field">
-                <label>⚡ Số luồng song song <span id="val-voice-conc">12 luồng</span></label>
-                <input id="voice-concurrency" type="range" min="1" max="32" step="1" value="12" />
+                <label title="Edge-TTS chịu được rất nhiều luồng (tối đa 500). CapCut/TikTok tự giới hạn 32, Google gTTS 16.">⚡ Số luồng song song <span id="val-voice-conc">12 luồng</span></label>
+                <input id="voice-concurrency" type="number" min="1" max="500" step="1" value="12" />
               </div>
             </div>
             <div class="field">
@@ -585,6 +785,76 @@
             <label style="display:flex;align-items:center;gap:6px;font-size:11.5px;margin-bottom:10px;cursor:pointer;">
               <input id="voice-fallback-edge" type="checkbox" checked /> Tự động dự phòng Edge-TTS nếu TikTok quá tải
             </label>
+            </div>
+
+            <!-- HIGGS TTS 3 -->
+            <div id="higgs-box" class="hidden">
+              <div class="higgs-status-row">
+                <span id="higgs-status" class="fit-report">Máy chủ Higgs: đang kiểm tra...</span>
+                <button id="btn-higgs-stop" class="btn btn-sm" title="Tắt máy chủ Higgs trong WSL để trả ~12GB VRAM (tool cũng tự tắt trước khi quét OCR / xuất video)">⏻ Tắt máy chủ</button>
+              </div>
+              <div class="hint-box" style="margin-bottom:8px;">
+                Tạo <b>48 câu cùng lúc</b> trên GPU (mỗi câu tự mang câu chữ + giọng mẫu + seed riêng, không lẫn nhau) →
+                Whisper nghe lại từng câu → câu nghi ngờ vào <b>Bảng kiểm tra voice</b>. Khi chọn Higgs, quét OCR / xóa sub / xuất video
+                chỉ chạy <b>sau khi tạo voice xong</b> (Higgs cần cả GPU).
+              </div>
+              <div class="field">
+                <label>Thư mục giọng mẫu (file âm thanh + file .txt lời cùng tên)</label>
+                <div class="inline-row">
+                  <input id="higgs-ref-folder" type="text" placeholder="D:\Download\Youtube\Voice\Mau" />
+                  <button id="btn-higgs-folder" class="btn btn-sm">Xem</button>
+                </div>
+              </div>
+              <div class="field">
+                <label>Giọng mẫu (<span id="higgs-ref-count">0</span> file)</label>
+                <select id="higgs-ref-list" size="4" style="height:86px;"></select>
+              </div>
+              <div class="field">
+                <label>File giọng mẫu đang dùng</label>
+                <div class="inline-row">
+                  <input id="higgs-ref" type="text" placeholder="Chọn ở danh sách trên hoặc bấm 📂" />
+                  <button id="btn-higgs-pick" class="btn btn-sm" title="Chọn file âm thanh giọng mẫu">📂</button>
+                </div>
+              </div>
+              <div class="field">
+                <label>Lời của giọng mẫu (clone chuẩn hơn hẳn khi có lời đúng)</label>
+                <textarea id="higgs-ref-text" rows="2" placeholder="Để trống: tự lấy file .txt cùng tên; không có thì Whisper tự nghe ra lời."></textarea>
+              </div>
+              <label class="chk-row" title="Tách giọng khỏi nhạc nền / tiếng nền (Mel-Roformer), khử vang / ồm (UVR-DeEcho-DeReverb), khử tạp âm (Mel-Roformer denoise). Đo DNSMOS trước / sau từng bước, rồi cắt đoạn 8–15 giây gồm các câu trọn vẹn.">
+                <input id="higgs-clean" type="checkbox" checked /> 🧼 Lọc sạch giọng mẫu (nhạc nền, tiếng ồn, vang / ồm) trước khi clone
+              </label>
+              <label class="chk-row" title="Tự động: chỉ giữ bước nào đo thấy giọng sạch hơn rõ (giọng mẫu sạch sẵn thì để nguyên, không làm hỏng). Mạnh: luôn chạy cả 3 bước, trừ khi bước đó làm mất giọng.">
+                <input id="higgs-clean-strong" type="checkbox" /> Lọc mạnh (luôn chạy đủ 3 bước — cho giọng mẫu thu ở phòng vang / có nhạc)
+              </label>
+              <button id="btn-higgs-prepare" class="btn btn-sm" style="width:100%;margin:4px 0 6px;">🎧 Lọc &amp; nghe thử giọng mẫu (trước / sau)</button>
+              <div id="higgs-ref-result" class="hint-box hidden" style="margin-bottom:8px;"></div>
+              <div class="row-2">
+                <label class="chk-row" title="Whisper (large-v3-turbo) nghe lại mọi câu, so từng từ với câu gốc">
+                  <input id="higgs-review" type="checkbox" checked /> Whisper kiểm tra mọi câu
+                </label>
+                <div class="field" style="margin:0;">
+                  <label>Tự tạo lại câu đọc sai</label>
+                  <select id="higgs-retry">
+                    <option value="0">Không</option>
+                    <option value="1" selected>1 lần</option>
+                    <option value="2">2 lần</option>
+                    <option value="3">3 lần</option>
+                  </select>
+                </div>
+              </div>
+              <label class="chk-row">
+                <input id="higgs-pause" type="checkbox" checked /> ⏸ Chạy A–Z: dừng lại chờ tôi kiểm tra nếu còn câu nghi ngờ
+              </label>
+              <button id="btn-voice-review" class="btn btn-sm btn-warn-outline" style="width:100%;margin-top:4px;">📋 Bảng kiểm tra voice</button>
+            </div>
+
+            <label class="chk-row" style="margin-top:6px;" title="Sau khi tạo voice: đo độ dài thật từng câu; câu nào dài hơn khung thời gian trên video (sẽ bị tua nhanh / đọc dồn) được AI rút gọn rồi tạo voice lại (chỉ các câu đó).">
+              <input id="voice-auto-fit" type="checkbox" checked /> ✂ Tự rút gọn câu đọc dài quá khung rồi tạo lại (chống tua nhanh)
+            </label>
+            <div id="voice-pending-row" class="fit-row hidden" style="margin-top:6px;">
+              <span id="voice-pending-text" class="fit-report bad"></span>
+              <button id="btn-voice-pending" class="btn btn-sm btn-primary" title="Chỉ tạo voice cho các câu đã đổi chữ sau lần tạo voice trước (rút gọn câu tràn khung / sửa tay). Các câu khác giữ nguyên voice cũ. Higgs: Whisper nghe lại luôn các câu mới.">🔄 Tạo voice cho câu đã đổi chữ</button>
+            </div>
             <div class="row-2">
               <button id="btn-preview-voice" class="btn btn-sm">🔊 Nghe thử giọng</button>
               <button id="btn-generate-voices" class="btn btn-sm btn-primary">🎙 Tạo Voice cho SRT</button>
@@ -596,6 +866,7 @@
 
       <!-- FOOTER RENDER BUTTONS -->
       <div class="inspector-footer">
+        <div id="job-timer" class="job-timer hidden" title="Đồng hồ đo thời gian của lần chạy gần nhất cho video đang chọn"></div>
         <div class="footer-btns">
           <button id="btn-render-sample" class="btn">⚡ Xuất thử 8s</button>
           <button id="btn-render-full" class="btn btn-primary">🎬 Xuất Video Full</button>
@@ -606,12 +877,70 @@
     </aside>
   </main>
 
+  <!-- MODAL: VOICE REVIEW (Higgs TTS 3 + Whisper) -->
+  <div id="vr-modal" class="modal-backdrop hidden">
+    <div class="modal-box vr-box">
+      <div class="modal-head">
+        <span>📋 Bảng kiểm tra voice — <span id="vr-title"></span></span>
+        <button id="btn-close-vr" class="btn btn-sm">✕</button>
+      </div>
+      <div class="vr-toolbar">
+        <span id="vr-counts" class="fit-report"></span>
+        <select id="vr-show">
+          <option value="flagged" selected>Chỉ câu nghi ngờ</option>
+          <option value="all">Tất cả câu</option>
+        </select>
+        <input id="vr-search" type="text" placeholder="Tìm chữ..." style="width:140px;" />
+        <span class="vr-spacer"></span>
+        <button id="btn-vr-pending" class="btn btn-sm btn-primary hidden" title="Các câu đã đổi chữ (rút gọn / sửa) sau khi tạo voice: voice hiện tại vẫn đọc chữ CŨ. Bấm để tạo voice cho đúng chữ mới.">🔄 Tạo voice câu đã đổi chữ</button>
+        <button id="btn-vr-ai" class="btn btn-sm" title="Gửi các câu nghi ngờ (chữ đúng + Whisper nghe + lý do) cho AI dịch (Antigravity / Gemini) soát 1 lượt: câu chỉ do Whisper chép sai (đồng âm, tên riêng, chính tả...) → tự đánh dấu OK; câu đọc sai thật → giữ lại để tạo lại. Câu có lỗi độ dài vẫn giữ để bạn nghe.">🤖 AI soát lỗi Whisper</button>
+        <button id="btn-vr-ai-bad" class="btn btn-sm hidden" title="Tạo lại các câu AI kết luận giọng đọc sai thật">↻ Tạo lại câu AI báo sai</button>
+        <button id="btn-vr-regen-sel" class="btn btn-sm">↻ Tạo lại câu đã chọn</button>
+        <button id="btn-vr-regen-all" class="btn btn-sm btn-primary">↻ Tạo lại tất cả trong danh sách</button>
+        <button id="btn-vr-ok-sel" class="btn btn-sm">✓ Đánh dấu OK</button>
+        <button id="btn-vr-unok-sel" class="btn btn-sm" title="Bỏ đánh dấu OK (vd AI đánh dấu nhầm) → câu quay lại danh sách nghi ngờ">✗ Bỏ OK</button>
+        <button id="btn-vr-done" class="btn btn-sm btn-success" title="Ghi nhận đã kiểm tra xong và chạy tiếp A–Z (dịch / voice lấy lại từ cache, chỉ ghép audio + xóa sub + xuất video)">✔ Xong kiểm tra → chạy tiếp</button>
+      </div>
+      <div id="vr-progress" class="vr-progress hidden"></div>
+      <div class="vr-table-wrap">
+        <table class="vr-table">
+          <thead>
+            <tr>
+              <th style="width:26px;"><input id="vr-check-all" type="checkbox" /></th>
+              <th style="width:70px;">#</th>
+              <th>Câu gốc (sửa được)</th>
+              <th>Voice tạo ra (Whisper nghe)</th>
+              <th style="width:24%;">Lý do sai</th>
+              <th style="width:44px;">Nghe</th>
+              <th style="width:74px;">Bản</th>
+              <th style="width:58px;">Tạo lại</th>
+            </tr>
+          </thead>
+          <tbody id="vr-tbody"></tbody>
+        </table>
+      </div>
+      <div class="vr-footer">
+        <span id="vr-page-info" class="fit-report"></span>
+        <div>
+          <button id="btn-vr-prev" class="btn btn-sm">◀</button>
+          <button id="btn-vr-next" class="btn btn-sm">▶</button>
+        </div>
+      </div>
+      <audio id="vr-player" class="hidden"></audio>
+    </div>
+  </div>
+
   <!-- MODAL: DOWNLOAD YOUTUBE / BILIBILI MULTI-THREADED -->
   <div id="dl-modal" class="modal-backdrop hidden">
     <div class="modal-box">
       <div class="modal-head">
         <span>⬇ Tải Video + Phụ Đề Siêu Tốc (YouTube / BiliBili)</span>
-        <button id="btn-close-dl-modal" class="btn btn-sm">✕</button>
+        <button id="btn-close-dl-modal" class="btn btn-sm" title="Đóng cửa sổ (video vẫn tải tiếp ở nền)">✕</button>
+      </div>
+      <div class="hint-box" style="margin-bottom:10px;">
+        Bước này chỉ <b>tải video + file phụ đề gốc</b> (sub chữ Trung/Anh… của YouTube/BiliBili) về <b>danh sách video</b> bên trái — chưa dịch, chưa xóa sub, chưa xuất.<br/>
+        Tải xong: chọn video → chỉnh cấu hình (khung xóa sub, phụ đề, logo…) → bấm <b>🚀 Chạy Trọn Gói A–Z</b>.
+        Đóng cửa sổ này thì video vẫn tải tiếp ở nền.
       </div>
       <div class="field">
         <label>Link Video YouTube hoặc BiliBili</label>
@@ -635,7 +964,7 @@
           </select>
         </div>
         <div class="field">
-          <label>⚡ Số luồng tải song song (aria2c)</label>
+          <label title="YouTube: tool tự tải trực tiếp với tối đa băng thông (nhiều luồng bị YouTube bóp tốc độ). Số luồng dùng cho BiliBili / video dạng HLS.">⚡ Số luồng (BiliBili / HLS)</label>
           <select id="dl-threads">
             <option value="8">8 luồng</option>
             <option value="16" selected>16 luồng (Siêu nhanh — Khuyên dùng)</option>
@@ -672,18 +1001,66 @@
               <option value="low" selected>Low (Nhanh)</option>
               <option value="medium">Medium</option>
               <option value="high">High</option>
+              <option value="xhigh">Extra High</option>
             </select>
           </div>
+        </div>
+        <div id="dl-model-resolved" class="model-resolved"></div>
+        <div id="dl-ai-batch" class="field hidden" style="margin-top:6px;">
+          <label title="AI chỉ trả về các dòng cần xóa/sửa nên gửi nhiều dòng 1 lần vẫn nhanh. Tự động: chia ~1500 dòng/lần, 6 lần song song (8 tiếng phim ~4 phút, sửa kỹ hơn). Cả file 1 lần: Antigravity tự đọc cả file trong 1 chat (10 940 dòng ~4 phút).">Số dòng mỗi lần gửi AI</label>
+          <select id="dl-clean-batch" title="AI chỉ trả về các dòng cần xóa/sửa nên gửi nhiều dòng 1 lần vẫn nhanh. Tự động: chia ~1500 dòng/lần, 6 lần song song (8 tiếng phim ~4 phút, sửa kỹ hơn). Cả file 1 lần: Antigravity tự đọc cả file trong 1 chat (10 940 dòng ~4 phút).">
+                  <option value="0" selected>Tự động — nhồi tối đa mỗi lần (ít lần gửi nhất)</option>
+                  <option value="300">300 dòng / lần</option>
+                  <option value="500">500 dòng / lần</option>
+                  <option value="1000">1000 dòng / lần</option>
+                  <option value="2000">2000 dòng / lần</option>
+                  <option value="100000">Cả file 1 lần (Antigravity tự đọc file — 1 chat duy nhất)</option>
+          </select>
         </div>
       </div>
       <div id="dl-status-box" class="hint-box hidden" style="margin-bottom:10px;"></div>
       <div style="display:flex;justify-content:flex-end;gap:8px;">
+        <button id="btn-stop-dl" class="btn btn-danger hidden">⏹ Dừng tải</button>
         <button id="btn-cancel-dl" class="btn">Đóng</button>
-        <button id="btn-start-dl" class="btn btn-success">⚡ Tải Video & Sub Ngay</button>
+        <button id="btn-start-dl" class="btn btn-success">⬇ Tải Video + Sub gốc về danh sách</button>
       </div>
     </div>
   </div>
 
+  <div id="gw-panel" class="gw-panel hidden">
+    <div class="gw-head">
+      <span>🌐 Gemini Web</span>
+      <span id="gw-title" class="gw-title"></span>
+      <button id="gw-min" class="btn btn-sm" title="Thu nhỏ / mở rộng">–</button>
+    </div>
+    <div id="gw-body" class="gw-body">
+      <div id="gw-meta" class="gw-meta"></div>
+      <div id="gw-status" class="gw-status"></div>
+      <div id="gw-attach" class="gw-attach hidden">
+        <div><b>Bước 1:</b> tải file SRT gốc rồi kéo / đính kèm vào Gemini (dấu + → Tải tệp lên):</div>
+        <div class="gw-actions">
+          <a id="gw-attach-dl" class="btn btn-sm btn-primary" href="#" download>⬇ Tải file SRT</a>
+          <a id="gw-attach-dl-txt" class="btn btn-sm" href="#" download title="Cùng nội dung, đuôi .txt — dùng khi Gemini không nhận file .srt">⬇ Tải dạng .txt</a>
+        </div>
+        <div><b>Bước 2:</b> bấm Copy câu lệnh, dán vào ô chat cùng với file → gửi.</div>
+      </div>
+      <div id="gw-prompt-actions" class="gw-actions">
+        <button id="gw-copy" class="btn btn-sm btn-primary" title="Copy toàn bộ prompt (hướng dẫn + style guide + các dòng cần dịch)">📋 Copy prompt</button>
+        <button id="gw-download" class="btn btn-sm" title="Tải prompt thành file .txt để đính kèm vào Gemini (khi prompt quá dài để dán)">⬇ Tải file prompt</button>
+        <button id="gw-open" class="btn btn-sm">↗ Mở Gemini</button>
+      </div>
+      <div id="gw-file-hint" class="gw-hint hidden">Gửi bằng file: đính kèm file vừa tải vào Gemini và gõ: <b>Làm đúng theo hướng dẫn trong file đính kèm.</b> <button id="gw-copy-short" class="btn btn-sm">Copy câu này</button></div>
+      <div class="gw-hint">Gemini trả lời xong → bấm nút <b>Copy</b> (dưới câu trả lời hoặc góc khối code) → bấm <b>Dán &amp; kiểm tra</b>.</div>
+      <textarea id="gw-result" class="gw-result" placeholder="…hoặc dán (Ctrl+V) câu trả lời của Gemini vào đây rồi bấm Kiểm tra &amp; nhận"></textarea>
+      <div class="gw-actions">
+        <button id="gw-paste" class="btn btn-sm btn-primary">📥 Dán &amp; kiểm tra</button>
+        <button id="gw-submit" class="btn btn-sm">✔ Kiểm tra &amp; nhận</button>
+        <button id="gw-partial" class="btn btn-sm hidden" title="Nhận các dòng đúng; các dòng thiếu / sai sẽ thành một yêu cầu mới nhỏ hơn để gửi lại">Nhận dòng đúng, gửi lại dòng thiếu</button>
+      </div>
+      <div id="gw-report" class="gw-report"></div>
+    </div>
+  </div>
+  <div id="toast-box" class="toast-box"></div>
   <script src="/static/app.js"></script>
 </body>
 </html>

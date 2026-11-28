@@ -17,22 +17,68 @@ ProgressCallback = Callable[[float, str], None]
 SAMPLE_RATE = 44100
 
 
-def _decode_to_mono_f32(audio_path: str, sr: int = SAMPLE_RATE, extra_af: str = "") -> np.ndarray:
-    """Decodes any audio/video file to 1D float32 numpy array at `sr` Hz via FFmpeg."""
+def _decode_to_mono_f32(
+    audio_path: str, sr: int = SAMPLE_RATE, extra_af: str = "", timeout: float = 600.0
+) -> np.ndarray:
+    """Decodes a (short) audio file to 1D float32 numpy array at `sr` Hz via FFmpeg. Long sources (the movie's
+    own audio track) are streamed with _PcmStream instead: an 8 h track is 5 GB of float32."""
     ffmpeg = get_ffmpeg_path()
-    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", audio_path]
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", audio_path, "-vn"]
     if extra_af:
         cmd.extend(["-af", extra_af])
     cmd.extend(["-ac", "1", "-ar", str(sr), "-f", "f32le", "pipe:1"])
-    res = subprocess.run(
-        cmd,
-        capture_output=True,
-        timeout=90,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    try:
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        return np.zeros(0, dtype=np.float32)
     if res.returncode != 0 or not res.stdout:
         return np.zeros(0, dtype=np.float32)
     return np.frombuffer(res.stdout, dtype=np.float32).copy()
+
+
+class _PcmStream:
+    """Streams a media file's audio as mono float32 blocks (constant memory, no timeout)."""
+
+    def __init__(self, path: str, sr: int = SAMPLE_RATE) -> None:
+        self.proc = subprocess.Popen(
+            [get_ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-nostdin", "-i", path, "-vn",
+             "-ac", "1", "-ar", str(sr), "-f", "f32le", "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.eof = False
+
+    def read(self, n: int) -> np.ndarray:
+        """Exactly n samples (zero padded after the end of the audio)."""
+        out = np.zeros(n, dtype=np.float32)
+        if self.eof or n <= 0:
+            return out
+        want, got = n * 4, bytearray()
+        while len(got) < want:
+            chunk = self.proc.stdout.read(want - len(got))
+            if not chunk:
+                self.eof = True
+                break
+            got += chunk
+        k = len(got) // 4
+        if k:
+            out[:k] = np.frombuffer(bytes(got[: k * 4]), dtype=np.float32)
+        return out
+
+    def close(self) -> None:
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=5)
+        except Exception:
+            pass
 
 
 def _trim_silence(pcm: np.ndarray, sr: int = SAMPLE_RATE, threshold_db: float = -38.0, pad_ms: int = 25) -> np.ndarray:
@@ -176,6 +222,195 @@ def build_crossfaded_bgm_pcm(
     return out
 
 
+# ----------------------------------------------------------------------------------------------------------
+# Block-wise (streaming) mixing
+#
+# The old code built every track for the whole video in RAM: an 8 h movie = 1.28e9 samples = 5.1 GB per
+# float32 track, and voice + original + mix + ducking envelope + stereo copy needed > 30 GB (and the original
+# audio decode had a 90 s timeout, after which the movie's own sound was silently dropped). Now the mix is
+# produced in 30 s blocks with the exact same math (placement, ducking ramps, crossfades), and only the
+# trimmed voice clips are kept (int16).
+# ----------------------------------------------------------------------------------------------------------
+
+_BLOCK_SEC = 30
+_ATTACK_SEC = 0.10
+_RELEASE_SEC = 0.24
+
+
+def _soft_limit(x: np.ndarray) -> np.ndarray:
+    """Per-sample soft limiter (block-safe). Leaves |x| <= 0.9 untouched and rounds peaks off below ~0.98.
+    (The old limiter divided the WHOLE track by its global peak, which needs the full track in memory.)"""
+    ax = np.abs(x)
+    over = ax > 0.9
+    if np.any(over):
+        x = x.copy()
+        x[over] = np.sign(x[over]) * (0.9 + 0.08 * np.tanh((ax[over] - 0.9) / 0.08))
+    return x
+
+
+class _DuckingEnvelope:
+    """Same envelope as _build_ducking_envelope (100 ms attack, 240 ms release), computed per block."""
+
+    def __init__(self, total: int, intervals: List[Tuple[int, int]], base: float, duck: float, sr: int = SAMPLE_RATE):
+        self.total, self.base, self.target = total, float(base), float(min(base, duck))
+        self.attack, self.release = int(sr * _ATTACK_SEC), int(sr * _RELEASE_SEC)
+        self.iv = sorted(intervals)
+        self.starts = [s for s, _ in self.iv]
+
+    def block(self, a: int, b: int) -> np.ndarray:
+        env = np.full(b - a, self.base, dtype=np.float32)
+        if not self.iv or self.target >= self.base:
+            return env
+        import bisect
+
+        # intervals that can touch [a, b): start < b + attack  and  end + release > a
+        hi = bisect.bisect_left(self.starts, b + self.attack)
+        lo = max(0, bisect.bisect_left(self.starts, a - self.release - 1) - 64)
+        for s, e in self.iv[lo:hi]:
+            s = max(0, min(self.total - 1, s))
+            e = max(s, min(self.total, e))
+            if e + self.release <= a or s - self.attack >= b:
+                continue
+            x0, x1 = max(a, s), min(b, e)
+            if x1 > x0:
+                env[x0 - a : x1 - a] = np.minimum(env[x0 - a : x1 - a], self.target)
+            a0 = max(0, s - self.attack)
+            if s > a0:
+                r0, r1 = max(a, a0), min(b, s)
+                if r1 > r0:
+                    ramp = np.linspace(self.base, self.target, s - a0, dtype=np.float32)
+                    env[r0 - a : r1 - a] = np.minimum(env[r0 - a : r1 - a], ramp[r0 - a0 : r1 - a0])
+            e1 = min(self.total, e + self.release)
+            if e1 > e:
+                r0, r1 = max(a, e), min(b, e1)
+                if r1 > r0:
+                    ramp = np.linspace(self.target, self.base, e1 - e, dtype=np.float32)
+                    env[r0 - a : r1 - a] = np.minimum(env[r0 - a : r1 - a], ramp[r0 - e : r1 - e])
+        return env
+
+
+class _BgmPlaylist:
+    """Same output as build_crossfaded_bgm_pcm, rendered per block: the playlist is laid out once as
+    (track, start sample, crossfade length) placements; a block sums the placements it overlaps."""
+
+    def __init__(self, bgm_cfg: BackgroundMusicConfig, total: int, sr: int = SAMPLE_RATE):
+        self.total = total
+        self.tracks: List[np.ndarray] = []
+        self.places: List[Tuple[int, int, int]] = []  # (track index, start, xfade-in length)
+        valid = [p for p in (bgm_cfg.file_paths or []) if p and Path(p).exists()]
+        if not bgm_cfg.enabled or not valid or total <= 0:
+            return
+        for fp in valid:
+            arr = _decode_to_mono_f32(fp, sr=sr)
+            if arr.size > sr * 0.5:
+                rms = float(np.sqrt(np.mean(arr**2)) + 1e-6)
+                self.tracks.append((arr * min(2.0, 0.14 / rms)).astype(np.float32))
+        if not self.tracks:
+            return
+        req_xfade = int(round(max(0.2, bgm_cfg.crossfade_sec) * sr))
+        pos, k = 0, 0
+        while pos < total:
+            ti = k % len(self.tracks)
+            trk = self.tracks[ti]
+            if k == 0:
+                self.places.append((ti, 0, 0))
+                pos = min(total, trk.size)
+            else:
+                xf = min(req_xfade, trk.size // 3, pos)
+                xf = xf if xf > 16 else 0
+                st = pos - xf
+                self.places.append((ti, st, xf))
+                pos = min(total, st + trk.size)
+            k += 1
+        self.fin = min(int(round(bgm_cfg.fade_in_sec * sr)), total // 4)
+        self.fout = min(int(round(bgm_cfg.fade_out_sec * sr)), total // 4)
+
+    @property
+    def active(self) -> bool:
+        return bool(self.places)
+
+    def block(self, a: int, b: int) -> np.ndarray:
+        out = np.zeros(b - a, dtype=np.float32)
+        n = len(self.places)
+        for i, (ti, st, xf) in enumerate(self.places):
+            trk = self.tracks[ti]
+            en = min(self.total, st + trk.size)
+            if en <= a or st >= b:
+                continue
+            x0, x1 = max(a, st), min(b, en)
+            seg = trk[x0 - st : x1 - st].copy()
+            if xf:  # fade in over [st, st + xf)
+                f1 = min(x1, st + xf)
+                if f1 > x0:
+                    theta = np.linspace(0.0, np.pi * 0.5, xf, dtype=np.float32)
+                    seg[: f1 - x0] *= np.sin(theta[x0 - st : f1 - st])
+            if i + 1 < n:  # fade out under the next placement's crossfade
+                _, nst, nxf = self.places[i + 1]
+                if nxf:
+                    f0, f1 = max(x0, nst), min(x1, nst + nxf)
+                    if f1 > f0:
+                        theta = np.linspace(0.0, np.pi * 0.5, nxf, dtype=np.float32)
+                        seg[f0 - x0 : f1 - x0] *= np.cos(theta[f0 - nst : f1 - nst])
+            out[x0 - a : x1 - a] += seg
+        if self.fin > 1 and a < self.fin:
+            r1 = min(b, self.fin)
+            out[: r1 - a] *= np.linspace(0.0, 1.0, self.fin, dtype=np.float32)[a:r1]
+        if self.fout > 1 and b > self.total - self.fout:
+            f0 = self.total - self.fout
+            r0 = max(a, f0)
+            out[r0 - a :] *= np.linspace(1.0, 0.0, self.fout, dtype=np.float32)[r0 - f0 : b - f0]
+        return out
+
+
+def _write_mix(
+    out_wav: Path,
+    total_samples: int,
+    clips: List[Tuple[int, np.ndarray]],
+    voice_gain: float,
+    orig_path: Optional[str],
+    orig_vol: float,
+    orig_env: Optional[_DuckingEnvelope],
+    bgm: Optional[_BgmPlaylist],
+    bgm_vol: float,
+    bgm_env: Optional[_DuckingEnvelope],
+    on_progress: Optional[ProgressCallback] = None,
+    pct0: float = 60.0,
+    pct1: float = 98.0,
+) -> None:
+    """Streams the final stereo PCM_16 WAV block by block. clips: (start sample, int16 pcm), sorted, no overlap."""
+    block = SAMPLE_RATE * _BLOCK_SEC
+    orig = _PcmStream(orig_path) if orig_path else None
+    ci = 0
+    try:
+        with sf.SoundFile(str(out_wav), mode="w", samplerate=SAMPLE_RATE, channels=2, subtype="PCM_16") as wf:
+            for a in range(0, total_samples, block):
+                b = min(total_samples, a + block)
+                mix = np.zeros(b - a, dtype=np.float32)
+                # voice clips (sorted by start; a clip may span two blocks)
+                while ci < len(clips) and clips[ci][0] + clips[ci][1].size <= a:
+                    ci += 1
+                j = ci
+                while j < len(clips) and clips[j][0] < b:
+                    st, pcm = clips[j]
+                    x0, x1 = max(a, st), min(b, st + pcm.size)
+                    if x1 > x0:
+                        mix[x0 - a : x1 - a] += pcm[x0 - st : x1 - st].astype(np.float32) * (voice_gain / 32767.0)
+                    j += 1
+                if orig is not None:
+                    o = orig.read(b - a)
+                    mix += o * (orig_env.block(a, b) if orig_env is not None else orig_vol)
+                if bgm is not None and bgm.active:
+                    mix += bgm.block(a, b) * (bgm_env.block(a, b) if bgm_env is not None else bgm_vol)
+                mix = _soft_limit(mix)
+                wf.write(np.stack([mix, mix], axis=-1))
+                if on_progress and total_samples:
+                    on_progress(round(pct0 + (pct1 - pct0) * b / total_samples, 1),
+                                f"Đang trộn & ghi audio: {b / SAMPLE_RATE / 60:.0f}/{total_samples / SAMPLE_RATE / 60:.0f} phút...")
+    finally:
+        if orig is not None:
+            orig.close()
+
+
 def build_standalone_audio_mix_sync(
     project: VideoProject,
     total_dur: float,
@@ -185,28 +420,53 @@ def build_standalone_audio_mix_sync(
     if not bgm_cfg.enabled or not bgm_cfg.file_paths:
         return None
     total_samples = int(np.ceil(max(0.5, total_dur) * SAMPLE_RATE))
-    bgm_pcm = build_crossfaded_bgm_pcm(bgm_cfg, total_samples, sr=SAMPLE_RATE)
-    if bgm_pcm.size == 0:
+    bgm = _BgmPlaylist(bgm_cfg, total_samples)
+    if not bgm.active:
         return None
-
-    mix = bgm_pcm * float(bgm_cfg.volume)
     audio_cfg = project.config.audio
     orig_vol = 0.0 if audio_cfg.mute_original else max(0.0, float(audio_cfg.original_volume))
-    if project.has_audio and orig_vol > 0.001 and Path(project.video_path).exists():
-        orig = _decode_to_mono_f32(project.video_path, sr=SAMPLE_RATE)
-        n = min(total_samples, orig.size)
-        if n > 0:
-            mix[:n] += orig[:n] * orig_vol
-
-    peak = float(np.max(np.abs(mix))) if mix.size else 0.0
-    if peak > 0.96:
-        mix = np.tanh(mix / max(1.0, peak) * 1.1) * 0.94
+    use_orig = project.has_audio and orig_vol > 0.001 and Path(project.video_path).exists()
 
     out_dir = PROJECTS_DIR / project.id
     out_dir.mkdir(parents=True, exist_ok=True)
     out_wav = out_dir / "bgm_only_mix.wav"
-    sf.write(str(out_wav), np.stack([mix, mix], axis=-1), SAMPLE_RATE, subtype="PCM_16")
+    _write_mix(out_wav, total_samples, [], 0.0, project.video_path if use_orig else None, orig_vol, None,
+               bgm, float(bgm_cfg.volume), None)
     return out_wav
+
+
+def _prep_clip(item: Dict[str, Any], next_start: Optional[float], total_dur: float, cfg: AudioConfig) -> Dict[str, Any]:
+    """Decode + trim one TTS clip and time-stretch it if it does not fit its slot (runs in a thread pool;
+    the old code stretched clips one after another in the main loop: one ffmpeg run per tight line)."""
+    ap = item.get("audio_path", "")
+    res: Dict[str, Any] = {"pcm": None, "saved": 0.0, "tempo": 1.0, "tight": False}
+    if not ap or not Path(ap).exists():
+        return res
+    raw = _decode_to_mono_f32(ap, sr=SAMPLE_RATE, timeout=120)
+    trimmed = _trim_silence(raw, sr=SAMPLE_RATE)
+    res["saved"] = max(0.0, (raw.size - trimmed.size) / SAMPLE_RATE)
+    if trimmed.size == 0:
+        return res
+    start_s, end_s = float(item["start_sec"]), float(item["end_sec"])
+    slot_dur = max(0.25, end_s - start_s)
+    clip_dur = trimmed.size / SAMPLE_RATE
+    if cfg.edit_mode == "narration":
+        nxt = (next_start - 0.08) if next_start is not None else total_dur
+        allowed = max(slot_dur, min(nxt - start_s, slot_dur + 1.8))
+        max_speed = max(1.05, cfg.max_atempo)
+    else:
+        allowed = slot_dur
+        max_speed = max(1.35, cfg.max_atempo)
+    pcm = trimmed
+    if clip_dur > allowed * 1.03:
+        tempo = min(max_speed, clip_dur / max(0.2, allowed))
+        res["tempo"] = tempo
+        res["tight"] = tempo > 1.35
+        stretched = _time_stretch_pcm(ap, tempo, sr=SAMPLE_RATE)
+        if stretched.size:
+            pcm = stretched
+    res["pcm"] = np.clip(pcm * 32767.0, -32768, 32767).astype(np.int16)
+    return res
 
 
 def assemble_project_audio_sync(
@@ -214,142 +474,86 @@ def assemble_project_audio_sync(
     manifest_path: str,
     on_progress: Optional[ProgressCallback] = None,
 ) -> Tuple[Path, Dict[str, Any]]:
-    """Assembles TTS clips + Original Audio + Crossfaded Background Music Playlist into 1 unified stereo WAV."""
+    """Assembles TTS clips + Original Audio + Crossfaded Background Music Playlist into 1 unified stereo WAV
+    (streamed in 30 s blocks: constant memory whatever the video length)."""
     m_path = Path(manifest_path)
     if not m_path.exists():
         raise RuntimeError("Không tìm thấy voice_manifest.json. Hãy tạo voice ở Bước 3 trước.")
 
     manifest = json.loads(m_path.read_text(encoding="utf-8"))
-    items: List[Dict[str, Any]] = manifest.get("items", [])
+    items: List[Dict[str, Any]] = sorted(manifest.get("items", []), key=lambda it: float(it["start_sec"]))
     if not items:
         raise RuntimeError("Danh sách voice rỗng.")
 
     cfg: AudioConfig = project.config.audio
     bgm_cfg: BackgroundMusicConfig = project.config.bgm
-    total_dur = max(project.duration, max(i["end_sec"] for i in items) + 0.5)
+    total_dur = max(project.duration, max(float(i["end_sec"]) for i in items) + 0.5)
     total_samples = int(np.ceil(total_dur * SAMPLE_RATE))
 
     if on_progress:
-        on_progress(10.0, f"Đang giải mã & cắt khoảng lặng cho {len(items)} file voice...")
+        on_progress(5.0, f"Đang giải mã, cắt khoảng lặng & co giãn {len(items)} file voice (song song)...")
 
-    def _prep_item(idx: int) -> Tuple[int, np.ndarray, float]:
-        item = items[idx]
-        ap = item.get("audio_path", "")
-        if not ap or not Path(ap).exists():
-            return idx, np.zeros(0, dtype=np.float32), 0.0
-        raw = _decode_to_mono_f32(ap, sr=SAMPLE_RATE)
-        raw_dur = raw.size / SAMPLE_RATE
-        trimmed = _trim_silence(raw, sr=SAMPLE_RATE)
-        saved = max(0.0, raw_dur - (trimmed.size / SAMPLE_RATE))
-        return idx, trimmed, saved
+    preps: List[Dict[str, Any]] = [None] * len(items)  # type: ignore[list-item]
+    done = [0]
 
-    decoded: Dict[int, np.ndarray] = {}
-    total_saved_sec = 0.0
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        for idx, pcm, saved in pool.map(_prep_item, range(len(items))):
-            decoded[idx] = pcm
-            total_saved_sec += saved
+    def _job(i: int) -> Tuple[int, Dict[str, Any]]:
+        nxt = float(items[i + 1]["start_sec"]) if i + 1 < len(items) else None
+        return i, _prep_clip(items[i], nxt, total_dur, cfg)
 
-    if on_progress:
-        mode_vn = "Thuyết minh" if cfg.edit_mode == "narration" else "Lồng tiếng"
-        on_progress(45.0, f"Đang căn chỉnh timing chế độ {mode_vn}...")
+    import os as _os
 
-    voice_track = np.zeros(total_samples, dtype=np.float32)
+    with ThreadPoolExecutor(max_workers=max(4, min(16, (_os.cpu_count() or 8)))) as pool:
+        for i, r in pool.map(_job, range(len(items))):
+            preps[i] = r
+            done[0] += 1
+            if on_progress and (done[0] % 50 == 0 or done[0] == len(items)):
+                on_progress(round(5.0 + 50.0 * done[0] / len(items), 1), f"Đã xử lý {done[0]}/{len(items)} file voice...")
+
+    # Placement (sequential): never overlap the previous line
+    clips: List[Tuple[int, np.ndarray]] = []
     speech_intervals: List[Tuple[int, int]] = []
     tempos_used: List[float] = []
     tight_cues = 0
-    cursor_end_sample = 0
-
-    for i, item in enumerate(items):
-        pcm = decoded.get(i, np.zeros(0, dtype=np.float32))
-        if pcm.size == 0:
+    total_saved_sec = 0.0
+    cursor_end = 0
+    for item, pr in zip(items, preps):
+        total_saved_sec += pr["saved"]
+        pcm = pr["pcm"]
+        if pcm is None or pcm.size == 0:
             continue
-
-        start_s = float(item["start_sec"])
-        end_s = float(item["end_sec"])
-        slot_dur = max(0.25, end_s - start_s)
-        clip_dur = pcm.size / SAMPLE_RATE
-
-        if cfg.edit_mode == "narration":
-            next_start = float(items[i + 1]["start_sec"]) - 0.08 if i + 1 < len(items) else total_dur
-            allowed_dur = max(slot_dur, min(next_start - start_s, slot_dur + 1.8))
-            max_speed = max(1.05, cfg.max_atempo)
-        else:
-            allowed_dur = slot_dur
-            max_speed = max(1.35, cfg.max_atempo)
-
-        tempo = 1.0
-        if clip_dur > allowed_dur * 1.03:
-            needed = clip_dur / max(0.2, allowed_dur)
-            tempo = min(max_speed, needed)
-            if tempo > 1.35:
-                tight_cues += 1
-            pcm = _time_stretch_pcm(item["audio_path"], tempo, sr=SAMPLE_RATE)
-        tempos_used.append(tempo)
-
-        start_sample = int(round(start_s * SAMPLE_RATE))
-        if start_sample < cursor_end_sample:
-            start_sample = cursor_end_sample + int(0.02 * SAMPLE_RATE)
-
-        end_sample = min(total_samples, start_sample + pcm.size)
-        if end_sample <= start_sample:
+        tempos_used.append(pr["tempo"])
+        tight_cues += int(pr["tight"])
+        st = int(round(float(item["start_sec"]) * SAMPLE_RATE))
+        if st < cursor_end:
+            st = cursor_end + int(0.02 * SAMPLE_RATE)
+        en = min(total_samples, st + pcm.size)
+        if en <= st:
             continue
+        clips.append((st, pcm[: en - st]))
+        speech_intervals.append((st, en))
+        cursor_end = en
 
-        seg = pcm[: end_sample - start_sample] * float(cfg.voice_gain)
-        voice_track[start_sample:end_sample] += seg
-        speech_intervals.append((start_sample, end_sample))
-        cursor_end_sample = end_sample
-
-    final_mix = voice_track.copy()
-
-    # Mix original video audio
     orig_vol = 0.0 if cfg.mute_original else max(0.0, float(cfg.original_volume))
-    if project.has_audio and orig_vol > 0.001 and Path(project.video_path).exists():
-        if on_progress:
-            on_progress(72.0, "Đang hòa âm với âm thanh gốc...")
-        orig_pcm = _decode_to_mono_f32(project.video_path, sr=SAMPLE_RATE)
-        if orig_pcm.size > 0:
-            n = min(total_samples, orig_pcm.size)
-            if cfg.edit_mode == "narration" and cfg.auto_ducking:
-                env = _build_ducking_envelope(
-                    n,
-                    speech_intervals,
-                    base_vol=orig_vol,
-                    duck_vol=min(orig_vol, float(cfg.duck_level)),
-                    sr=SAMPLE_RATE,
-                )
-                final_mix[:n] += orig_pcm[:n] * env
-            else:
-                final_mix[:n] += orig_pcm[:n] * orig_vol
-
-    # Mix Crossfaded Background Music Playlist (with optional Auto-Ducking under voice!)
-    bgm_used = False
+    use_orig = project.has_audio and orig_vol > 0.001 and Path(project.video_path).exists()
+    orig_env = (
+        _DuckingEnvelope(total_samples, speech_intervals, orig_vol, min(orig_vol, float(cfg.duck_level)))
+        if use_orig and cfg.edit_mode == "narration" and cfg.auto_ducking
+        else None
+    )
+    bgm = None
+    bgm_env = None
     if bgm_cfg.enabled and bgm_cfg.file_paths:
         if on_progress:
-            on_progress(85.0, f"Đang nối chéo nhạc nền ({len(bgm_cfg.file_paths)} bài, crossfade {bgm_cfg.crossfade_sec}s)...")
-        bgm_pcm = build_crossfaded_bgm_pcm(bgm_cfg, total_samples, sr=SAMPLE_RATE)
-        if bgm_pcm.size > 0:
-            bgm_used = True
-            if bgm_cfg.auto_ducking and speech_intervals:
-                b_env = _build_ducking_envelope(
-                    total_samples,
-                    speech_intervals,
-                    base_vol=float(bgm_cfg.volume),
-                    duck_vol=min(float(bgm_cfg.volume), float(bgm_cfg.duck_level)),
-                    sr=SAMPLE_RATE,
-                )
-                final_mix += bgm_pcm * b_env
-            else:
-                final_mix += bgm_pcm * float(bgm_cfg.volume)
+            on_progress(57.0, f"Đang chuẩn bị nhạc nền ({len(bgm_cfg.file_paths)} bài, crossfade {bgm_cfg.crossfade_sec}s)...")
+        bgm = _BgmPlaylist(bgm_cfg, total_samples)
+        if bgm.active and bgm_cfg.auto_ducking and speech_intervals:
+            bgm_env = _DuckingEnvelope(total_samples, speech_intervals, float(bgm_cfg.volume),
+                                       min(float(bgm_cfg.volume), float(bgm_cfg.duck_level)))
 
-    # Soft broadcast peak limiter
-    peak = float(np.max(np.abs(final_mix))) if final_mix.size else 0.0
-    if peak > 0.96:
-        final_mix = np.tanh(final_mix / max(1.0, peak) * 1.1) * 0.94
-
-    stereo = np.stack([final_mix, final_mix], axis=-1)
     out_wav = PROJECTS_DIR / project.id / f"dub_mix_{cfg.edit_mode}.wav"
-    sf.write(str(out_wav), stereo, SAMPLE_RATE, subtype="PCM_16")
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    _write_mix(out_wav, total_samples, clips, float(cfg.voice_gain), project.video_path if use_orig else None,
+               orig_vol, orig_env, bgm, float(bgm_cfg.volume), bgm_env, on_progress)
 
     stats = {
         "mode": cfg.edit_mode,
@@ -357,11 +561,11 @@ def assemble_project_audio_sync(
         "avg_tempo": round(float(np.mean(tempos_used)) if tempos_used else 1.0, 3),
         "tight_cues": tight_cues,
         "silence_trimmed_sec": round(total_saved_sec, 2),
-        "bgm_mixed": bgm_used,
+        "bgm_mixed": bool(bgm is not None and bgm.active),
         "wav_path": str(out_wav),
     }
     if on_progress:
-        bgm_txt = " + Nhạc nền Crossfade" if bgm_used else ""
+        bgm_txt = " + Nhạc nền Crossfade" if stats["bgm_mixed"] else ""
         on_progress(
             100.0,
             f"Ghép audio xong ({stats['cues_assembled']} câu{bgm_txt}, tốc độ TB {stats['avg_tempo']}x)",

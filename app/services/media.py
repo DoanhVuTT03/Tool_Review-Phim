@@ -88,16 +88,7 @@ def parse_srt(srt_path: str) -> List[SubtitleCue]:
     path = Path(srt_path)
     if not path.exists():
         return []
-    raw_bytes = path.read_bytes()
-    text = ""
-    for enc in ("utf-8-sig", "utf-8", "cp1258", "gb18030", "cp1252"):
-        try:
-            text = raw_bytes.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
-    if not text:
-        text = raw_bytes.decode("utf-8", errors="replace")
+    text = _decode_subtitle_bytes(path.read_bytes())
 
     blocks = re.split(r"\r?\n\r?\n+", text.strip())
     cues: List[SubtitleCue] = []
@@ -121,12 +112,38 @@ def parse_srt(srt_path: str) -> List[SubtitleCue]:
         body = "\n".join(lines[time_line_idx + 1 :]).strip()
         if not body:
             continue
-        idx = auto_idx
-        if time_line_idx == 1 and lines[0].strip().isdigit():
-            idx = int(lines[0].strip())
-        cues.append(SubtitleCue(index=idx, start_sec=start_sec, end_sec=end_sec, text=body))
+        # Always the cue's position (1, 2, 3...), never the number written in the file: downloaded / hand-edited
+        # SRTs often repeat or skip numbers, and translation, AI cleaning and TTS are keyed by this index, so a
+        # duplicate number made one line silently overwrite another (lost subtitles / voice lines).
+        cues.append(SubtitleCue(index=auto_idx, start_sec=start_sec, end_sec=end_sec, text=body))
         auto_idx += 1
     return cues
+
+
+def _decode_subtitle_bytes(raw: bytes) -> str:
+    """UTF-8 first. Otherwise Chinese GBK/GB18030 vs Vietnamese cp1258: the old fixed order tried cp1258 first,
+    which can decode many GBK files into garbage. Pick the decoding that yields mostly CJK text."""
+    for enc in ("utf-8-sig", "utf-8"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    candidates = []
+    for enc in ("gb18030", "cp1258", "cp1252"):
+        try:
+            candidates.append((enc, raw.decode(enc)))
+        except UnicodeDecodeError:
+            continue
+    for enc, txt in candidates:
+        if enc == "gb18030":
+            non_ascii = [ch for ch in txt if ord(ch) > 127]
+            cjk = sum(1 for ch in non_ascii if "\u4e00" <= ch <= "\u9fff" or "\u3000" <= ch <= "\u303f" or "\uff00" <= ch <= "\uffef")
+            if non_ascii and cjk / len(non_ascii) > 0.6:
+                return txt
+    for enc, txt in candidates:
+        if enc != "gb18030":
+            return txt
+    return raw.decode("utf-8", errors="replace")
 
 
 def write_srt(cues: List[SubtitleCue], out_path: str) -> None:
@@ -134,7 +151,8 @@ def write_srt(cues: List[SubtitleCue], out_path: str) -> None:
     for i, c in enumerate(cues, start=1):
         lines.append(str(i))
         lines.append(f"{format_srt_time(c.start_sec)} --> {format_srt_time(c.end_sec)}")
-        lines.append(c.text.strip())
+        # a blank line inside a cue would end the cue for every SRT reader
+        lines.append("\n".join(ln for ln in c.text.strip().splitlines() if ln.strip()) or " ")
         lines.append("")
     Path(out_path).write_text("\n".join(lines), encoding="utf-8")
 

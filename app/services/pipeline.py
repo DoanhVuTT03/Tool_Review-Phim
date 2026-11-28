@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -7,11 +8,26 @@ from app.config import PROJECTS_DIR
 from app.models import VideoProject
 from app.services.audio_assembler import assemble_project_audio_sync
 from app.services.cancel import begin_job, cancel_project, is_cancelled
+from app.services.gpu_gate import gpu_gate
 from app.services.hardware import detect_hardware
 from app.services.render_engine import render_project_async
+from app.services import timing
 from app.services.store import store
+from app.services.sub_remover import ai_clean_boxes, prescan_ocr_sync
 from app.services.translator import translate_project_srt
 from app.services.tts_engine import generate_project_voices
+
+
+@contextlib.asynccontextmanager
+async def _slot(sems, project_id: str, label: str):
+    """Acquires the batch semaphores; the time spent waiting for a free slot shows up as its own step."""
+    sems = [s for s in sems if s is not None] or [asyncio.Semaphore(1)]
+    st = timing.begin_step(project_id, "wait", label) if any(s.locked() for s in sems) else None
+    async with contextlib.AsyncExitStack() as stack:
+        for s in sems:
+            await stack.enter_async_context(s)
+        timing.end_step(st)
+        yield
 
 
 class BatchPipelineManager:
@@ -34,7 +50,10 @@ class BatchPipelineManager:
         hw = detect_hardware()
         tier = hw["tier"]
         if profile == "workstation" or (profile == "auto" and tier == "workstation"):
-            return {"io_jobs": 4, "tts_conc": 10, "ai_gpu": 2, "encode_gpu": hw["recommended_render_workers"]}
+            # ai_gpu=1: one AI Clean Sub render already saturates the CPU (inpaint threads scale with cores);
+            # 2 at once measured the same total fps (i5-12400F + RTX 3060: 290 fps either way) but each video
+            # finished later and RAM doubled. Other videos keep translating / voicing / OCR-prescanning meanwhile.
+            return {"io_jobs": 4, "tts_conc": 10, "ai_gpu": 1, "encode_gpu": hw["recommended_render_workers"]}
         if profile == "dual_gpu_max":
             return {"io_jobs": 3, "tts_conc": 8, "ai_gpu": 1, "encode_gpu": 2}
         # Balanced laptop default (protects MX230 2GB VRAM & laptop thermals while overlapping stages)
@@ -68,47 +87,101 @@ class BatchPipelineManager:
                 p.progress = round(pct, 1)
                 p.status_message = msg
 
+        prescan_task: Optional[asyncio.Task] = None
+        ok = False
+        timing.start_job(project_id, "Chạy trọn gói A–Z" if (do_translate and do_voice and do_render) else "Chạy các bước đã chọn")
         try:
+            # 0. AI Clean Sub: OCR-scan the hardsub while translation / TTS wait on the network (CPU + GPU are
+            #    idle then). The render later reads the OCR cache instead of scanning (~15% faster render).
+            will_io = (do_translate and bool(proj.srt_path) and Path(proj.srt_path).exists()) or (
+                do_voice and bool(proj.translated_srt_path or proj.srt_path)
+            )
+            sr = proj.config.sub_removal
+            # Higgs TTS 3 needs the whole GPU: with it, the OCR scan starts only after the voice is done
+            higgs = do_voice and proj.config.voice.provider == "higgs3"
+            want_prescan = do_render and ai_clean_boxes(proj) and sr.auto_detect_ocr and not preview_seconds
+
+            def _start_prescan(label: str) -> asyncio.Task:
+                def _prescan_timed() -> int:
+                    st = timing.begin_step(project_id, "ocr_prescan", label)
+                    try:
+                        n = prescan_ocr_sync(proj)
+                    except BaseException:
+                        timing.end_step(st, ok=False)
+                        raise
+                    timing.end_step(st, ok=True, note=f"{n} mẫu OCR" if n else "đã có cache")
+                    return n
+
+                async def _gated() -> int:
+                    async with gpu_gate.shared():
+                        return await asyncio.to_thread(_prescan_timed)
+
+                return asyncio.create_task(_gated())
+
+            if want_prescan and will_io and not higgs:
+                prescan_task = _start_prescan("Quét OCR sub gốc (song song lúc dịch / voice)")
+
             # 1. Translate SRT (if requested & source SRT exists)
             if do_translate and proj.srt_path and Path(proj.srt_path).exists():
-                async with (io_sem or asyncio.Semaphore(1)):
+                async with _slot([io_sem], project_id, "Chờ lượt dịch (hàng loạt)"):
                     _update("translating", 2.0, "[Bước 1/4] Bắt đầu phân tích & dịch SRT...")
-                    out_srt = await translate_project_srt(
-                        proj,
-                        on_progress=lambda p, m: _update("translating", p * 0.25, f"[Dịch SRT] {m}"),
-                    )
+                    with timing.step(project_id, "translate", "Dịch SRT"):
+                        out_srt = await translate_project_srt(
+                            proj,
+                            on_progress=lambda p, m: _update("translating", p * 0.25, f"[Dịch SRT] {m}"),
+                        )
                     proj.translated_srt_path = str(out_srt)
                     store.upsert_project(proj)
 
             # 2. Generate Voice (CapCut/TikTok Free + Edge-TTS + gTTS with user concurrency)
             manifest_path: Optional[Path] = None
             if do_voice and (proj.translated_srt_path or proj.srt_path):
-                async with (io_sem or asyncio.Semaphore(1)):
+                async with _slot([io_sem], project_id, "Chờ lượt tạo voice (hàng loạt)"):
                     v_conc = proj.config.voice.concurrency or tts_conc
-                    _update("voicing", 28.0, f"[Bước 2/4] Bắt đầu tạo Voice AI ({v_conc} luồng)...")
-                    manifest_path = await generate_project_voices(
-                        proj,
-                        concurrency=v_conc,
-                        on_progress=lambda p, m: _update("voicing", 25.0 + p * 0.25, f"[Voice] {m}"),
-                    )
+                    v_label = "Higgs TTS 3, 48 câu cùng lúc + Whisper kiểm tra" if higgs else f"{v_conc} luồng"
+                    _update("voicing", 28.0, f"[Bước 2/4] Bắt đầu tạo Voice AI ({v_label})...")
+                    with timing.step(project_id, "voice", f"Tạo Voice ({v_label})"):
+                        manifest_path = await generate_project_voices(
+                            proj,
+                            concurrency=v_conc,
+                            on_progress=lambda p, m: _update("voicing", 25.0 + p * 0.25, f"[Voice] {m}"),
+                        )
                     proj.voice_dir = str(manifest_path.parent)
                     store.upsert_project(proj)
+                if higgs:
+                    from app.services.higgs_voice import needs_review_pause
+
+                    n_bad = needs_review_pause(proj)
+                    if n_bad:
+                        proj.status = "ready"
+                        proj.progress = 100.0
+                        proj.status_message = (
+                            f"⏸ Tạm dừng: Whisper thấy {n_bad} câu voice nghi ngờ. Mở «Bảng kiểm tra voice» ở Bước 3, "
+                            "nghe / tạo lại, rồi bấm «Xong kiểm tra → chạy tiếp»."
+                        )
+                        store.upsert_project(proj)
+                        ok = True
+                        return {"ok": True, "project_id": proj.id, "paused_for_review": n_bad}
             else:
                 # Reuse existing manifest if present
                 cand = PROJECTS_DIR / proj.id / "voice_cache" / "voice_manifest.json"
                 if cand.exists():
                     manifest_path = cand
 
+            if want_prescan and prescan_task is None and higgs:
+                prescan_task = _start_prescan("Quét OCR sub gốc (sau khi Higgs tạo voice xong)")
+
             # 3. Assemble Narration / Dubbing Audio WAV
             dub_wav: Optional[Path] = None
             if do_render and manifest_path and manifest_path.exists():
                 _update("rendering", 52.0, "[Bước 3/4] Đang ghép timeline Thuyết minh/Lồng tiếng...")
-                dub_wav, _ = await asyncio.to_thread(
-                    assemble_project_audio_sync,
-                    proj,
-                    str(manifest_path),
-                    lambda p, m: _update("rendering", 50.0 + p * 0.12, f"[Audio] {m}"),
-                )
+                with timing.step(project_id, "audio", "Ghép audio (thuyết minh / lồng tiếng)"):
+                    dub_wav, _ = await asyncio.to_thread(
+                        assemble_project_audio_sync,
+                        proj,
+                        str(manifest_path),
+                        lambda p, m: _update("rendering", 50.0 + p * 0.12, f"[Audio] {m}"),
+                    )
                 proj.dub_audio_path = str(dub_wav)
                 store.upsert_project(proj)
             elif proj.dub_audio_path and Path(proj.dub_audio_path).exists():
@@ -116,33 +189,49 @@ class BatchPipelineManager:
 
             # 4. Final Single-Pass Render: AI Clean Sub (OCR on CPU+Iris+MX230, inpaint) is streamed into the
             #    same ffmpeg that overlays subtitles/logo and encodes once with QSV/NVENC.
+            if prescan_task is not None:
+                wait_st = None
+                if not prescan_task.done():
+                    _update("rendering", 54.0, "[Bước 4/4] Đang chờ OCR quét sub gốc xong...")
+                    wait_st = timing.begin_step(project_id, "wait", "Chờ OCR quét sub gốc xong")
+                try:
+                    await prescan_task
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass  # the render scans by itself (OCR on the fly) if the pre-scan failed
+                timing.end_step(wait_st)
+                prescan_task = None
+
             if do_render:
                 ai_on = proj.config.sub_removal.mode == "ai_clean"
-                async with (enc_sem or asyncio.Semaphore(1)):
-                    async with (ai_sem if ai_on and ai_sem else asyncio.Semaphore(1)):
-                        _update(
-                            "rendering", 55.0,
-                            "[Bước 4/4] Đang xóa sub AI + xuất video trong 1 lượt..." if ai_on
-                            else "[Bước 4/4] Đang xuất video hoàn chỉnh bằng GPU...",
-                        )
-                        out_mp4 = await render_project_async(
-                            proj,
-                            preview_seconds=preview_seconds,
-                            voice_wav_path=str(dub_wav) if dub_wav else None,
-                            voice_already_mixed=bool(dub_wav),
-                            on_progress=lambda p, m: _update("rendering", 55.0 + p * 0.45, f"[Xuất Video] {m}"),
-                        )
+                async with _slot([enc_sem, ai_sem if ai_on else None], project_id, "Chờ lượt xuất video (hàng loạt)"), \
+                        gpu_gate.shared():
+                    _update(
+                        "rendering", 55.0,
+                        "[Bước 4/4] Đang xóa sub AI + xuất video trong 1 lượt..." if ai_on
+                        else "[Bước 4/4] Đang xuất video hoàn chỉnh bằng GPU...",
+                    )
+                    out_mp4 = await render_project_async(
+                        proj,
+                        preview_seconds=preview_seconds,
+                        voice_wav_path=str(dub_wav) if dub_wav else None,
+                        voice_already_mixed=bool(dub_wav),
+                        on_progress=lambda p, m: _update("rendering", 55.0 + p * 0.45, f"[Xuất Video] {m}"),
+                    )
                     proj.output_path = str(out_mp4)
                     proj.status = "done"
                     proj.progress = 100.0
                     proj.status_message = f"Hoàn tất A–Z: {out_mp4.name}"
                     store.upsert_project(proj)
+                    ok = True
                     return {"ok": True, "project_id": proj.id, "output_path": str(out_mp4)}
 
             proj.status = "done"
             proj.progress = 100.0
             proj.status_message = "Hoàn tất các bước đã chọn!"
             store.upsert_project(proj)
+            ok = True
             return {"ok": True, "project_id": proj.id}
 
         except Exception as e:
@@ -152,6 +241,12 @@ class BatchPipelineManager:
                 p.status_message = f"Lỗi: {e}"
                 store.upsert_project(p)
             raise
+        finally:
+            timing.end_job(project_id, ok, "" if ok else ("Đã dừng" if is_cancelled(project_id) else "Lỗi"))
+            if prescan_task is not None and not prescan_task.done():
+                # translation/voice failed or was stopped: let the scan thread end (it checks the cancel flag,
+                # and its result is only a cache) without leaving an un-awaited task error behind.
+                prescan_task.add_done_callback(lambda t: t.cancelled() or t.exception())
 
     def start_batch(
         self,

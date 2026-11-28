@@ -1,5 +1,7 @@
 from __future__ import annotations
 import json
+import os
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -8,24 +10,35 @@ from app.models import ChannelPreset, EditConfig, VideoProject
 
 
 PROJECTS_FILE = PROJECTS_DIR / "projects.json"
+PROJECTS_BACKUP = PROJECTS_DIR / "projects.json.bak"
 
 
 class StateStore:
     def __init__(self) -> None:
+        # save_projects() runs from the event loop AND from worker threads (render / timing): serialize it
+        self._save_lock = threading.RLock()
         self.projects: Dict[str, VideoProject] = {}
         self.presets: Dict[str, ChannelPreset] = {}
         self.load_all()
 
     def load_all(self) -> None:
         self.projects.clear()
-        if PROJECTS_FILE.exists():
+        # A corrupt/partial projects.json used to silently drop EVERY project. Now: fall back to the backup,
+        # and skip only the items that fail validation.
+        for src in (PROJECTS_FILE, PROJECTS_BACKUP):
+            if not src.exists():
+                continue
             try:
-                raw = json.loads(PROJECTS_FILE.read_text(encoding="utf-8"))
-                for item in raw:
-                    proj = VideoProject.model_validate(item)
-                    self.projects[proj.id] = proj
+                raw = json.loads(src.read_text(encoding="utf-8"))
             except Exception:
-                pass
+                continue
+            for item in raw if isinstance(raw, list) else []:
+                try:
+                    proj = VideoProject.model_validate(item)
+                except Exception:
+                    continue
+                self.projects[proj.id] = proj
+            break
 
         self.presets.clear()
         for fp in sorted(PRESETS_DIR.glob("*.json")):
@@ -45,8 +58,18 @@ class StateStore:
             self.save_preset(default_p)
 
     def save_projects(self) -> None:
-        data = [p.model_dump() for p in self.projects.values()]
-        PROJECTS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        """Atomic write (tmp file + rename) with a backup of the previous version: a crash or power loss in
+        the middle of a write can no longer leave a truncated projects.json behind."""
+        with self._save_lock:
+            data = [p.model_dump() for p in list(self.projects.values())]
+            tmp = PROJECTS_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                if PROJECTS_FILE.exists():
+                    os.replace(PROJECTS_FILE, PROJECTS_BACKUP)
+            except OSError:
+                pass
+            os.replace(tmp, PROJECTS_FILE)
 
     def list_projects(self) -> List[VideoProject]:
         return list(self.projects.values())

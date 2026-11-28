@@ -19,6 +19,36 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 
+const FIELD_NAMES = {
+  batch_size: "Số dòng mỗi lô (Batch) — Tab Dịch SRT",
+  concurrency: "Số luồng song song",
+  length_tolerance_pct: "Độ chênh độ dài (%)",
+  font_size: "Cỡ chữ phụ đề",
+  outline_width: "Viền chữ",
+  ocr_sample_fps: "Tần suất quét OCR",
+  blur_strength: "Độ mờ khung",
+  speed: "Tốc độ đọc",
+  max_atempo: "Tua tối đa",
+};
+
+function formatApiError(status, txt) {
+  try {
+    const data = JSON.parse(txt);
+    if (typeof data.detail === "string") return data.detail;
+    if (Array.isArray(data.detail)) {
+      return data.detail
+        .map((d) => {
+          const field = (d.loc || []).filter((x) => typeof x === "string" && x !== "body").pop() || "";
+          const name = FIELD_NAMES[field] || field;
+          const lim = d.ctx && (d.ctx.le ?? d.ctx.ge ?? d.ctx.lt ?? d.ctx.gt);
+          return `• ${name}: giá trị không hợp lệ${lim !== undefined ? ` (giới hạn ${lim})` : ""} — ${d.msg}`;
+        })
+        .join("\n");
+    }
+  } catch {}
+  return txt || `HTTP ${status}`;
+}
+
 async function api(url, opts = {}) {
   const res = await fetch(url, {
     headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
@@ -26,10 +56,31 @@ async function api(url, opts = {}) {
   });
   if (!res.ok) {
     const txt = await res.text();
-    throw new Error(txt || `HTTP ${res.status}`);
+    const err = new Error(formatApiError(res.status, txt));
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }
+
+function showToast(msg, kind = "err", ms = 9000) {
+  const box = document.getElementById("toast-box");
+  if (!box) return alert(msg);
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
+  el.textContent = msg;
+  el.title = "Bấm để đóng";
+  el.addEventListener("click", () => el.remove());
+  box.appendChild(el);
+  setTimeout(() => el.remove(), ms);
+}
+
+// Every button handler is async; a failed request (e.g. 422 when saving settings, 409 when the video is busy)
+// used to end as an unhandled rejection: nothing happened on screen. Show it.
+window.addEventListener("unhandledrejection", (ev) => {
+  const msg = ev.reason && ev.reason.message ? ev.reason.message : String(ev.reason || "Lỗi không xác định");
+  showToast(`⚠ ${msg}`, "err");
+});
 
 function activeProject() {
   return state.projects.find((p) => p.id === state.activeProjectId) || null;
@@ -72,6 +123,8 @@ async function init() {
     selectProject(state.projects[0].id);
   }
   window.addEventListener("resize", fitStageCanvas);
+  setInterval(renderJobTimer, 500); // live stopwatch of the selected video
+  initGeminiWeb();
 }
 
 async function loadHardware() {
@@ -82,6 +135,24 @@ async function loadHardware() {
     const dualTxt = hw.dual_gpu_capable ? "Dual-GPU" : `${hw.cpu_cores}C/${hw.cpu_threads}T`;
     $("hw-text").textContent = `${dualTxt} • ${hw.ram_gb}GB RAM`;
     $("hw-badge").title = `${hw.summary}\nGPUs: ${(hw.gpus || []).join(", ")}\nFFmpeg: ${hw.ffmpeg_version}`;
+    // Encoder / performance dropdowns: show what "Tự động" resolves to on THIS machine, disable what it lacks
+    const encNames = { h264_nvenc: "NVIDIA NVENC", h264_qsv: "Intel QSV", libx264: "CPU libx264" };
+    const encSel = $("cfg-encoder");
+    if (encSel) {
+      for (const opt of encSel.options) {
+        if (!opt.dataset.label) opt.dataset.label = opt.textContent;
+        if (opt.value === "auto") {
+          opt.textContent = `Tự động — máy này: ${encNames[hw.recommended_encoder] || hw.recommended_encoder} (khuyên dùng)`;
+        } else {
+          const ok = hw.encoders && hw.encoders[opt.value];
+          opt.disabled = !ok;
+          opt.textContent = opt.dataset.label + (ok ? "" : " — máy này không có");
+        }
+      }
+    }
+    const tierNames = { workstation: "Workstation (RTX)", dual_gpu_laptop: "Dual-GPU Laptop", igpu_laptop: "Laptop iGPU", cpu_only: "Chỉ CPU" };
+    const perfAuto = $("cfg-perf") && $("cfg-perf").querySelector('option[value="auto"]');
+    if (perfAuto) perfAuto.textContent = `Tự động — máy này: ${tierNames[hw.tier] || hw.tier} (khuyên dùng)`;
   } catch {
     $("hw-text").textContent = "Lỗi kiểm tra phần cứng";
   }
@@ -130,9 +201,19 @@ async function loadConfigs() {
   $("tr-model").innerHTML = modelOptions;
   $("tr-model").value = "gemini-4-neon";
   $("clean-srt-model").innerHTML = modelOptions;
-  $("clean-srt-model").value = "gemini-3.8-flash";
   $("dl-clean-model").innerHTML = modelOptions;
-  $("dl-clean-model").value = "gemini-3.8-flash";
+  // default for cleaning: a fast model that exists in this Antigravity (Hydrogen, else Flash, else the first)
+  const fastDefault = ["gemini-4-hydrogen", "gemini-3.8-flash"].find((id) => state.models.some((m) => m.id === id)) || (state.models[0] || {}).id;
+  $("clean-srt-model").value = fastDefault;
+  $("dl-clean-model").value = fastDefault;
+  // show which exact Antigravity model (model + thinking level) will run
+  [["tr-model", "tr-thinking", "tr-model-resolved"], ["clean-srt-model", "clean-srt-thinking", "clean-model-resolved"],
+   ["dl-clean-model", "dl-clean-thinking", "dl-model-resolved"]].forEach(([m, t, out]) => {
+    const upd = () => showResolvedModel($(m).value, $(t).value, out);
+    $(m).addEventListener("change", upd);
+    $(t).addEventListener("change", upd);
+    upd();
+  });
 
   const fillLang = (sel, defVal, includeAll = false) => {
     sel.innerHTML =
@@ -150,6 +231,7 @@ async function loadConfigs() {
   fontSel.innerHTML =
     `<option value="">Mặc định (Arial Bold)</option>` +
     state.fonts.map((f) => `<option value="${f.path}">${f.name}</option>`).join("");
+  $("ch-font").innerHTML = fontSel.innerHTML;
 }
 
 async function loadVoices(provider, language, includeMultilingual = true) {
@@ -210,6 +292,289 @@ async function loadProjects() {
   renderVideoList();
 }
 
+// Old saved ids -> Antigravity family ids ("claude-opus-5.5" -> "claude-opus-5-5", "orchestrator" -> neon orchestrator)
+function normalizeModelId(id) {
+  if (!id) return id;
+  if (id === "orchestrator") return "gemini-pro-orchestrator-neon";
+  if (id.startsWith("claude")) return id.replace(/(\d)\.(\d)/, "$1-$2");
+  return id;
+}
+
+async function showResolvedModel(model, thinking, outId) {
+  const el = $(outId);
+  if (!el || !model) return;
+  try {
+    const r = await api(`/api/config/resolve-model?model=${encodeURIComponent(model)}&thinking=${encodeURIComponent(thinking || "medium")}`);
+    el.textContent = `Antigravity sẽ chạy: ${r.model_id}${r.note ? ` (${r.note})` : ""}`;
+  } catch {
+    el.textContent = "";
+  }
+}
+
+// ---------------- JOB STOPWATCH (per video: total + each step) ----------------
+
+function escHtml(v) {
+  return String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function fmtDur(sec) {
+  sec = Math.max(0, Math.round(sec || 0));
+  const h = Math.floor(sec / 3600);
+  const m = String(Math.floor((sec % 3600) / 60)).padStart(2, "0");
+  const s = String(sec % 60).padStart(2, "0");
+  return h ? `${h}:${m}:${s}` : `${m}:${s}`;
+}
+
+function timingTotal(t) {
+  if (!t || !t.started) return 0;
+  return (t.ended || Date.now() / 1000) - t.started;
+}
+
+// Whole-file translation: Batch / thread settings only matter for the (rare) gap-filling pass -> hide them.
+function syncWholeFileUi(on) {
+  $("tr-batch-field").classList.toggle("hidden", on);
+  $("tr-conc-field").classList.toggle("hidden", on);
+  $("tr-whole-note").classList.toggle("hidden", !on);
+}
+
+// Provider-specific fields: Gemini Web has no model / thinking / batch / threads / key in the tool.
+function syncProviderUi() {
+  const web = $("tr-provider").value === "gemini_web";
+  ["tr-thinking-field", "tr-model-field", "tr-model-resolved", "tr-apikey-field"].forEach((id) =>
+    $(id).classList.toggle("hidden", web)
+  );
+  $("tr-whole-file").closest("label").classList.toggle("hidden", web);
+  $("tr-web-box").classList.toggle("hidden", !web);
+  $("tr-web-auto-row").classList.toggle("hidden", $("tr-web-mode").value !== "auto");
+  if (web) {
+    $("tr-batch-field").classList.add("hidden");
+    $("tr-conc-field").classList.add("hidden");
+    $("tr-whole-note").classList.add("hidden");
+    updateWebPlan();
+  } else {
+    syncWholeFileUi($("tr-whole-file").checked);
+  }
+}
+
+// "21740 dòng → 87 phần × ~250 dòng": same split rule as gemini_web.chunk_size_for
+function updateWebPlan() {
+  const el = $("tr-web-plan");
+  if (!el) return;
+  const total = state.cpTotal || 0;
+  const max = Math.max(20, Number($("tr-web-chunk").value) || 250);
+  if (!total) {
+    el.textContent = `File ≤ ${max} dòng: gửi nguyên 1 phần · dài hơn: chia đều nhiều phần (≤ ${max} dòng/phần).`;
+    return;
+  }
+  const parts = Math.ceil(total / max);
+  const size = Math.ceil(total / parts);
+  const left = Math.max(0, total - (state.cpDone || 0));
+  el.textContent = parts === 1
+    ? `File ${total} dòng → gửi nguyên 1 phần.`
+    : `File ${total} dòng → ${parts} phần × ~${size} dòng` + (state.cpDone ? ` (còn ${left} dòng chưa dịch).` : ".");
+}
+
+// ---------------- GEMINI WEB RELAY PANEL ----------------
+const GW = { id: null, info: null, min: false, lastReport: null };
+
+function initGeminiWeb() {
+  $("gw-min").addEventListener("click", () => {
+    GW.min = !GW.min;
+    $("gw-panel").classList.toggle("gw-min", GW.min);
+    $("gw-min").textContent = GW.min ? "+" : "–";
+  });
+  $("gw-copy").addEventListener("click", async () => {
+    const txt = await gwPrompt();
+    if (txt == null) return;
+    await gwCopy(txt);
+    showToast(`Đã copy prompt (${txt.length.toLocaleString()} ký tự). Dán vào Gemini rồi gửi.`, "info", 4000);
+  });
+  $("gw-download").addEventListener("click", async () => {
+    const txt = await gwPrompt();
+    if (txt == null) return;
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([txt], { type: "text/plain;charset=utf-8" }));
+    const first = GW.info && GW.info.first ? `_dong_${GW.info.first}-${GW.info.last}` : "_style_guide";
+    a.download = `gemini_prompt${first}.txt`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    $("gw-file-hint").classList.remove("hidden");
+  });
+  $("gw-copy-short").addEventListener("click", () => gwCopy("Làm đúng theo hướng dẫn trong file đính kèm."));
+  $("gw-open").addEventListener("click", () => window.open("https://gemini.google.com/app", "gemini_web"));
+  $("gw-paste").addEventListener("click", async () => {
+    try {
+      const txt = await navigator.clipboard.readText();
+      if (!txt.trim()) return showToast("Clipboard đang trống. Bấm Copy dưới câu trả lời của Gemini trước.", "err", 5000);
+      $("gw-result").value = txt;
+    } catch {
+      return showToast("Trình duyệt không cho đọc clipboard: dán (Ctrl+V) vào ô rồi bấm Kiểm tra & nhận.", "err", 6000);
+    }
+    gwSubmit(false);
+  });
+  $("gw-submit").addEventListener("click", () => gwSubmit(false));
+  $("gw-partial").addEventListener("click", () => gwSubmit(true));
+
+  $("btn-web-open").addEventListener("click", async () => {
+    try {
+      const r = await api("/api/gemini-web/browser/open", { method: "POST" });
+      $("tr-web-status").textContent = r.already
+        ? "Cửa sổ Chrome Gemini của tool đang mở."
+        : "Đã mở cửa sổ Chrome Gemini. Lần đầu: đăng nhập Google trong cửa sổ đó, rồi bấm Kiểm tra kết nối.";
+    } catch (e) { $("tr-web-status").textContent = e.message; }
+  });
+  $("btn-web-check").addEventListener("click", async () => {
+    $("tr-web-status").textContent = "Đang kiểm tra...";
+    try {
+      const r = await api("/api/gemini-web/browser/status");
+      $("tr-web-status").textContent = (r.ready ? "✅ " : "⚠ ") + r.message;
+    } catch (e) { $("tr-web-status").textContent = e.message; }
+  });
+
+  const poll = async () => {
+    try {
+      const r = await api("/api/gemini-web/pending");
+      renderGeminiWeb(r.pending);
+    } catch {}
+  };
+  poll();
+  setInterval(poll, 2000);
+}
+
+async function gwPrompt() {
+  if (!GW.id) return null;
+  try {
+    const res = await fetch(`/api/gemini-web/prompt/${GW.id}`);
+    if (!res.ok) throw new Error("Yêu cầu này không còn chờ.");
+    return await res.text();
+  } catch (e) {
+    showToast(e.message, "err", 5000);
+    return null;
+  }
+}
+
+async function gwCopy(txt) {
+  try {
+    await navigator.clipboard.writeText(txt);
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = txt;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    ta.remove();
+  }
+}
+
+async function gwSubmit(partial) {
+  if (!GW.id) return;
+  const text = $("gw-result").value;
+  if (!text.trim()) return showToast("Chưa có câu trả lời để kiểm tra.", "err", 4000);
+  try {
+    const r = await api("/api/gemini-web/submit", {
+      method: "POST",
+      body: JSON.stringify({ id: GW.id, text, accept_partial: partial }),
+    });
+    gwShowReport(r);
+    if (r.ok) {
+      $("gw-result").value = "";
+      showToast(r.message, "info", 4000);
+    }
+  } catch (e) {
+    showToast(e.message, "err", 6000);
+  }
+}
+
+function gwShowReport(r) {
+  GW.lastReport = r;
+  const box = $("gw-report");
+  box.textContent = r ? r.message : "";
+  box.className = "gw-report" + (r ? (r.ok ? " ok" : " bad") : "");
+  $("gw-partial").classList.toggle("hidden", !(r && !r.ok && r.good > 0));
+}
+
+function renderGeminiWeb(p) {
+  const panel = $("gw-panel");
+  if (!p) {
+    panel.classList.add("hidden");
+    GW.id = null;
+    return;
+  }
+  const isNew = p.id !== GW.id;
+  GW.id = p.id;
+  GW.info = p;
+  panel.classList.remove("hidden");
+  $("gw-title").textContent = p.label;
+  const lines = p.n_lines ? ` · ${p.n_lines} dòng (${p.first}–${p.last})` : "";
+  $("gw-meta").textContent = p.attachment_name
+    ? `${p.project_name} · gửi file ${p.attachment_name} + câu lệnh ${p.chars.toLocaleString()} ký tự`
+    : `${p.project_name}${lines} · prompt ${p.chars.toLocaleString()} ký tự` +
+      (p.chars > 60000 ? " — dài: nên dùng Tải file prompt" : "");
+  const att = !!p.attachment_name;
+  $("gw-attach").classList.toggle("hidden", !att);
+  $("gw-download").classList.toggle("hidden", att);
+  $("gw-copy").textContent = att ? "📋 Copy câu lệnh" : "📋 Copy prompt";
+  if (att && isNew) {
+    $("gw-attach-dl").href = `/api/gemini-web/attachment/${p.id}`;
+    $("gw-attach-dl").setAttribute("download", p.attachment_name);
+    $("gw-attach-dl").textContent = `⬇ Tải file ${p.attachment_name}`;
+    $("gw-attach-dl-txt").href = `/api/gemini-web/attachment/${p.id}?txt=1`;
+    $("gw-attach-dl-txt").setAttribute("download", `${p.attachment_name}.txt`);
+  }
+  const auto = p.state === "auto";
+  $("gw-status").textContent = p.status || "";
+  $("gw-status").className = "gw-status" + (auto ? " auto" : "");
+  ["gw-copy", "gw-download", "gw-paste", "gw-submit"].forEach((id) => ($(id).disabled = auto));
+  $("gw-result").disabled = auto;
+  if (isNew) {
+    $("gw-result").value = "";
+    $("gw-file-hint").classList.add("hidden");
+    gwShowReport(null);
+    if (!auto) {
+      if (GW.min) $("gw-min").click();
+      panel.classList.remove("gw-attn");
+      void panel.offsetWidth;
+      panel.classList.add("gw-attn");
+    }
+  } else if (p.report && !GW.lastReport && !auto) {
+    gwShowReport(p.report);
+  }
+}
+
+function renderJobTimer() {
+  const box = $("job-timer");
+  if (!box) return;
+  const p = activeProject();
+  const t = p && p.timing;
+  if (!t || !t.started) {
+    box.classList.add("hidden");
+    return;
+  }
+  const running = !t.ended;
+  const now = Date.now() / 1000;
+  const label = running ? "đang chạy" : t.ok ? "xong" : t.note || "lỗi";
+  const steps = (t.steps || [])
+    .map((st) => {
+      const end = st.end || (running ? now : st.start);
+      const ico = st.status === "running" ? "●" : st.status === "error" ? "✕" : "✓";
+      const cls = `${st.status || "done"}${st.key === "wait" ? " wait" : ""}`;
+      return `<div class="jt-step ${cls}"><span class="jt-ico">${ico}</span><span>${escHtml(st.label)}</span><span class="jt-dur">${fmtDur(end - st.start)}</span>${
+        st.note ? `<span class="jt-note">${escHtml(st.note)}</span>` : ""
+      }</div>`;
+    })
+    .join("");
+  const html =
+    `<div class="jt-head"><span class="jt-title">⏱ ${escHtml(t.title)} · ${escHtml(label)}</span>` +
+    `<span class="jt-total" title="Tổng thời gian chạy 1 video (tính cả các bước chạy song song)">${fmtDur(timingTotal(t))}</span></div>${steps}`;
+  box.classList.remove("hidden");
+  box.classList.toggle("running", running);
+  box.classList.toggle("failed", !running && t.ok === false);
+  if (box._last !== html) {
+    box.innerHTML = html;
+    box._last = html;
+  }
+}
+
 // ---------------- VIDEO LIST ----------------
 
 const BUSY_STATUSES = ["downloading", "translating", "voicing", "cleaning", "rendering"];
@@ -243,6 +608,10 @@ function renderVideoList() {
       const voiceTag = p.dub_audio_path ? `<span class="tag ok">Có Voice</span>` : "";
       const bgmTag = p.config?.bgm?.enabled && p.config?.bgm?.file_paths?.length ? `<span class="tag">🎵 BGM</span>` : "";
       const busy = ["downloading", "translating", "voicing", "cleaning", "rendering"].includes(p.status);
+      const timeTag =
+        p.timing && p.timing.ended
+          ? `<span class="tag ${p.timing.ok ? "ok" : "err"}" title="${escHtml(p.timing.title)}: tổng thời gian lần chạy gần nhất">⏱ ${fmtDur(timingTotal(p.timing))}</span>`
+          : "";
       const stTag =
         p.status === "done"
           ? `<span class="tag ok">Đã xuất</span>`
@@ -261,6 +630,7 @@ function renderVideoList() {
           ${voiceTag}
           ${bgmTag}
           ${stTag}
+          ${timeTag}
         </div>
         ${
           busy || p.progress > 0
@@ -367,6 +737,9 @@ async function loadStyleGuideInfo(projectId) {
   try {
     const res = await api(`/api/projects/${projectId}/style-guide`);
     $("style-guide-editor").value = res.content || "";
+    state.cpTotal = res.checkpoint_total || 0;
+    state.cpDone = res.checkpoint_done || 0;
+    updateWebPlan();
     $("tr-checkpoint-info").textContent =
       res.checkpoint_total > 0
         ? `Checkpoint: Đã dịch ${res.checkpoint_done}/${res.checkpoint_total} dòng`
@@ -473,7 +846,10 @@ function cleanUiText(text) {
 }
 
 async function applySubtitleFont(fontPath) {
-  const inner = $("ov-subtitle-inner");
+  return applyFontTo($("ov-subtitle-inner"), fontPath);
+}
+
+async function applyFontTo(inner, fontPath) {
   if (!inner) return;
 
   if (!fontPath) {
@@ -517,7 +893,17 @@ function syncSubtitleVisual() {
   const stageH = $("video-canvas-wrap").clientHeight || 540;
   const scale = stageH / 1080;
 
-  inner.textContent = getCurrentSubtitleText();
+  const txt = getCurrentSubtitleText();
+  if (inner.textContent !== txt || inner.dataset.fx !== (cfg.effect || "none")) {
+    inner.textContent = txt;
+    inner.dataset.fx = cfg.effect || "none";
+    inner.className = "";
+    if (cfg.effect && cfg.effect !== "none") {
+      void inner.offsetWidth; // restart the CSS animation
+      inner.style.setProperty("--fx-dur", `${cfg.effect_duration || 0.3}s`);
+      inner.className = `sub-fx-${cfg.effect}`;
+    }
+  }
   inner.style.fontSize = `${Math.max(10, Math.round(cfg.font_size * scale))}px`;
   inner.style.fontWeight = cfg.bold ? "700" : "400";
   inner.style.color = cfg.text_color;
@@ -650,18 +1036,102 @@ function syncAudioPreview() {
   vid.volume = Math.min(1.0, Math.max(0.0, a.original_volume));
 }
 
+function syncChannelVisual() {
+  const proj = activeProject();
+  if (!proj) return;
+  const cfg = proj.config.channel_text;
+  const el = $("ov-channel");
+  const inner = $("ov-channel-inner");
+  if (!cfg) return;
+  el.classList.toggle("hidden", !cfg.enabled);
+  if (!cfg.enabled) return;
+  applyBoxStyle(el, cfg.box);
+  const scale = ($("video-canvas-wrap").clientHeight || 540) / 1080;
+  inner.textContent = cfg.text || " ";
+  inner.style.fontSize = `${Math.max(8, Math.round(cfg.font_size * scale))}px`;
+  inner.style.fontWeight = cfg.bold ? "700" : "400";
+  inner.style.color = cfg.text_color;
+  inner.style.textAlign = cfg.align || "center";
+  inner.style.padding = `${Math.round(cfg.padding_y * scale)}px ${Math.round(cfg.padding_x * scale)}px`;
+  inner.style.borderRadius = `${Math.round(cfg.border_radius * scale)}px`;
+  inner.style.background = cfg.bg_enabled ? hexToRgba(cfg.bg_color, cfg.bg_opacity) : "transparent";
+  const ow = Math.max(0, cfg.outline_width * scale);
+  inner.style.webkitTextStroke = ow > 0 ? `${ow.toFixed(1)}px ${cfg.outline_color}` : "0px transparent";
+  inner.style.paintOrder = "stroke fill";
+  inner.style.setProperty("--fx-period", `${cfg.effect_period_sec || 8}s`);
+  const fxClass = cfg.effect && cfg.effect !== "none" ? `ch-fx-${cfg.effect}` : "";
+  if (inner.dataset.fx !== fxClass) {
+    inner.className = "";
+    void inner.offsetWidth;
+    inner.className = fxClass;
+    inner.dataset.fx = fxClass;
+  }
+  applyFontTo(inner, cfg.font_path);
+}
+
+function syncWmVisual() {
+  const proj = activeProject();
+  const cont = $("ov-wm-container");
+  if (!proj || !cont) return;
+  const cfg = proj.config.wm_removal;
+  const boxes = cfg && cfg.enabled ? cfg.boxes || [] : [];
+  if (cont.children.length !== boxes.length) {
+    cont.innerHTML = boxes
+      .map(
+        (_, i) => `<div class="ov-box ov-wm" data-layer="wm" data-idx="${i}">
+          <span class="ov-label">Chữ logo #${i + 1}</span>
+          <div class="handle nw" data-dir="nw"></div><div class="handle n" data-dir="n"></div><div class="handle ne" data-dir="ne"></div>
+          <div class="handle w" data-dir="w"></div><div class="handle e" data-dir="e"></div>
+          <div class="handle sw" data-dir="sw"></div><div class="handle s" data-dir="s"></div><div class="handle se" data-dir="se"></div>
+        </div>`
+      )
+      .join("");
+    selectLayer(state.activeLayer, state.activeWmIdx);
+  }
+  Array.from(cont.children).forEach((el, i) => {
+    applyBoxStyle(el, boxes[i]);
+    el.classList.toggle("mode-blur", cfg.mode === "blur");
+  });
+}
+
+function renderWmList() {
+  const proj = activeProject();
+  const list = $("wm-list");
+  if (!proj || !list) return;
+  const boxes = proj.config.wm_removal.boxes || [];
+  list.innerHTML = boxes.length
+    ? boxes
+        .map(
+          (b, i) => `<div class="wm-row ${state.activeLayer === "wm" && state.activeWmIdx === i ? "active" : ""}" data-idx="${i}">
+            <span>Vùng #${i + 1} — X ${b.x.toFixed(2)} · Y ${b.y.toFixed(2)} · ${b.w.toFixed(2)}×${b.h.toFixed(2)}</span>
+            <button class="btn btn-sm btn-danger btn-wm-del" data-idx="${i}">Xóa</button>
+          </div>`
+        )
+        .join("")
+    : `<div style="font-size:11.5px;color:var(--text-2);margin-bottom:6px;">Chưa có vùng nào — bấm "+ Thêm vùng chữ logo".</div>`;
+}
+
 function syncAllOverlays() {
   syncSubtitleVisual();
   syncLogoVisual();
   syncGreenScreenVisual();
   syncSubRemovalVisual();
+  syncWmVisual();
+  syncChannelVisual();
   syncAudioPreview();
 }
 
-function selectLayer(layerName) {
+function selectLayer(layerName, idx) {
   state.activeLayer = layerName;
+  if (layerName === "wm") state.activeWmIdx = Number.isInteger(idx) ? idx : state.activeWmIdx || 0;
   document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("active", c.dataset.layer === layerName));
-  document.querySelectorAll(".ov-box").forEach((b) => b.classList.toggle("selected", b.dataset.layer === layerName));
+  document.querySelectorAll(".ov-box").forEach((b) =>
+    b.classList.toggle(
+      "selected",
+      b.dataset.layer === layerName && (layerName !== "wm" || Number(b.dataset.idx) === state.activeWmIdx)
+    )
+  );
+  if (layerName === "wm") renderWmList();
 }
 
 // ---------------- DRAG & 8-HANDLE INDEPENDENT WxH RESIZE ----------------
@@ -669,43 +1139,48 @@ function selectLayer(layerName) {
 function initOverlayDragResize() {
   let dragState = null;
 
-  const getBoxRef = (layer) => {
+  const getBoxRef = (layer, idx) => {
     const proj = activeProject();
     if (!proj) return null;
     if (layer === "subtitle") return proj.config.subtitle.box;
     if (layer === "logo") return proj.config.logo.box;
     if (layer === "greenscreen") return proj.config.green_screen.box;
     if (layer === "subremoval") return proj.config.sub_removal.box;
+    if (layer === "channel") return proj.config.channel_text.box;
+    if (layer === "wm") return (proj.config.wm_removal.boxes || [])[idx] || null;
     return null;
   };
 
-  document.querySelectorAll(".ov-box").forEach((boxEl) => {
-    boxEl.addEventListener("mousedown", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const layer = boxEl.dataset.layer;
-      selectLayer(layer);
-      const boxRef = getBoxRef(layer);
-      if (!boxRef) return;
+  // one delegated listener: also covers boxes added later (text-logo regions)
+  $("video-canvas-wrap").addEventListener("mousedown", (e) => {
+    const boxEl = e.target.closest(".ov-box");
+    if (!boxEl) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const layer = boxEl.dataset.layer;
+    const idx = boxEl.dataset.idx !== undefined ? Number(boxEl.dataset.idx) : undefined;
+    selectLayer(layer, idx);
+    const boxRef = getBoxRef(layer, idx);
+    if (!boxRef) return;
 
-      const wrap = $("video-canvas-wrap").getBoundingClientRect();
-      const handle = e.target.closest(".handle");
-      dragState = {
-        layer,
-        mode: handle ? "resize" : "move",
-        dir: handle ? handle.dataset.dir : "",
-        startX: e.clientX,
-        startY: e.clientY,
-        orig: { ...boxRef },
-        wrapW: wrap.width,
-        wrapH: wrap.height,
-      };
-    });
+    const wrap = $("video-canvas-wrap").getBoundingClientRect();
+    const handle = e.target.closest(".handle");
+    dragState = {
+      layer,
+      idx,
+      mode: handle ? "resize" : "move",
+      dir: handle ? handle.dataset.dir : "",
+      startX: e.clientX,
+      startY: e.clientY,
+      orig: { ...boxRef },
+      wrapW: wrap.width,
+      wrapH: wrap.height,
+    };
   });
 
   window.addEventListener("mousemove", (e) => {
     if (!dragState) return;
-    const boxRef = getBoxRef(dragState.layer);
+    const boxRef = getBoxRef(dragState.layer, dragState.idx);
     if (!boxRef) return;
 
     const dx = (e.clientX - dragState.startX) / dragState.wrapW;
@@ -747,6 +1222,11 @@ function initOverlayDragResize() {
       syncGreenScreenVisual();
     } else if (dragState.layer === "subremoval") {
       syncSubRemovalVisual();
+    } else if (dragState.layer === "channel") {
+      syncChannelVisual();
+    } else if (dragState.layer === "wm") {
+      syncWmVisual();
+      renderWmList();
     }
   });
 
@@ -832,6 +1312,49 @@ function populateInspectorFromProject(proj) {
   $("val-gs-blend").textContent = Number(c.green_screen.blend).toFixed(2);
   $("gs-loop").checked = c.green_screen.loop_enabled;
 
+  // Subtitle effect
+  $("sub-effect").value = c.subtitle.effect || "none";
+  $("sub-effect-dur").value = c.subtitle.effect_duration || 0.3;
+  $("val-sub-fx-dur").textContent = `${Number(c.subtitle.effect_duration || 0.3).toFixed(2)}s`;
+
+  // Text-logo / watermark removal
+  $("wm-enabled").checked = !!c.wm_removal.enabled;
+  $("wm-mode").value = c.wm_removal.mode;
+  $("wm-blur").value = c.wm_removal.blur_strength;
+  $("val-wm-blur").textContent = String(c.wm_removal.blur_strength);
+  $("wm-blur-opts").classList.toggle("hidden", c.wm_removal.mode !== "blur");
+  renderWmList();
+
+  // Channel name
+  {
+    const ch = c.channel_text;
+    $("ch-enabled").checked = !!ch.enabled;
+    $("ch-text").value = ch.text || "";
+    if (ch.font_path && !Array.from($("ch-font").options).some((o) => o.value === ch.font_path)) {
+      const o = document.createElement("option");
+      o.value = ch.font_path;
+      o.textContent = ch.font_path.split(/[\\/]/).pop();
+      $("ch-font").appendChild(o);
+    }
+    $("ch-font").value = ch.font_path || "";
+    $("ch-size").value = ch.font_size;
+    $("val-ch-size").textContent = `${ch.font_size}px`;
+    $("ch-outline").value = ch.outline_width;
+    $("val-ch-outline").textContent = `${ch.outline_width}px`;
+    $("ch-color").value = ch.text_color;
+    $("ch-outline-color").value = ch.outline_color;
+    $("ch-bg-enabled").checked = !!ch.bg_enabled;
+    $("ch-bold").checked = !!ch.bold;
+    $("ch-bg-color").value = ch.bg_color;
+    $("ch-bg-opacity").value = ch.bg_opacity;
+    $("val-ch-bg-op").textContent = `${Math.round(ch.bg_opacity * 100)}%`;
+    $("ch-radius").value = ch.border_radius;
+    $("val-ch-radius").textContent = `${ch.border_radius}px`;
+    $("ch-effect").value = ch.effect || "none";
+    $("ch-period").value = ch.effect_period_sec || 8;
+    $("ch-period-field").classList.toggle("hidden", !["shimmer", "slide_in", "typewriter"].includes(ch.effect));
+  }
+
   // Sub removal
   $("sr-mode").value = c.sub_removal.mode;
   $("sr-blur-strength").value = c.sub_removal.blur_strength;
@@ -861,6 +1384,7 @@ function populateInspectorFromProject(proj) {
   $("tr-src-lang").value = c.translate.source_lang;
   $("tr-tgt-lang").value = c.translate.target_lang === "tl" ? "fil" : c.translate.target_lang;
   $("tr-provider").value = c.translate.provider;
+  c.translate.model = normalizeModelId(c.translate.model);
   if (state.models.some((m) => m.id === c.translate.model)) {
     $("tr-model").value = c.translate.model;
   } else {
@@ -868,10 +1392,17 @@ function populateInspectorFromProject(proj) {
     c.translate.model = "gemini-4-neon";
   }
   $("tr-thinking").value = c.translate.thinking_level === "max" ? "xhigh" : c.translate.thinking_level;
+  showResolvedModel($("tr-model").value, $("tr-thinking").value, "tr-model-resolved");
   $("tr-batch").value = c.translate.batch_size;
+  $("tr-whole-file").checked = !!c.translate.whole_file;
+  syncWholeFileUi(!!c.translate.whole_file);
   $("tr-tol").value = c.translate.length_tolerance_pct;
   $("tr-concurrency").value = c.translate.concurrency || 4;
   $("tr-api-key").value = c.translate.api_key || "";
+  $("tr-web-mode").value = c.translate.web_mode || "manual";
+  $("tr-web-chunk").value = c.translate.web_chunk_lines || 250;
+  $("tr-web-newchat").checked = c.translate.web_new_chat ?? true;
+  syncProviderUi();
 
   // Voice
   $("voice-provider").value = c.voice.provider;
@@ -883,6 +1414,11 @@ function populateInspectorFromProject(proj) {
   $("val-voice-conc").textContent = `${c.voice.concurrency || 12} luồng`;
   $("voice-tiktok-sid").value = c.voice.tiktok_session_id || "";
   $("voice-fallback-edge").checked = c.voice.fallback_edge_tts;
+  applyHiggsConfig(c);
+  if (proj) {
+    refreshLengthReport(proj.id);
+    refreshReviewButton(proj.id);
+  }
 }
 
 async function loadLogoFolderGrid(folderPath) {
@@ -936,13 +1472,21 @@ async function flushSave(proj) {
       config: proj.config,
     }),
   });
+  state.lastSaveErr = null; // next distinct error will be shown again
 }
 
 function scheduleAutoSave() {
   const proj = activeProject();
   if (!proj) return;
   clearTimeout(state.saveTimer);
-  state.saveTimer = setTimeout(() => flushSave(proj).catch(console.error), 250);
+  state.saveTimer = setTimeout(
+    () =>
+      flushSave(proj).catch((e) => {
+        if (state.lastSaveErr !== e.message) showToast(`⚠ Không lưu được cấu hình:\n${e.message}`, "err");
+        state.lastSaveErr = e.message;
+      }),
+    250
+  );
 }
 
 // ---------------- ACTION TRIGGERS & POLLING ----------------
@@ -978,6 +1522,7 @@ function startStatusPolling(projectId) {
         p.translated_srt_path = st.translated_srt_path || p.translated_srt_path;
         p.style_guide_path = st.style_guide_path || p.style_guide_path;
         p.dub_audio_path = st.dub_audio_path || p.dub_audio_path;
+        p.timing = st.timing || p.timing;
       }
       renderVideoList();
       if (state.activeProjectId === projectId) {
@@ -990,6 +1535,7 @@ function startStatusPolling(projectId) {
           await Promise.all([loadProjectSubtitles(projectId), loadStyleGuideInfo(projectId)]);
           if (p) $("proj-srt-path").value = p.translated_srt_path || p.srt_path || "";
           syncSubtitleVisual();
+          afterJobRefresh(projectId, st);
         }
       }
     } catch {
@@ -1018,6 +1564,7 @@ function startBatchPolling() {
       if (!st.running) {
         clearInterval(state.batchPollTimer);
         updateStopButton();
+        if (cur) afterJobRefresh(cur.id, cur);
       }
     } catch {
       clearInterval(state.batchPollTimer);
@@ -1084,10 +1631,62 @@ function bindStaticEvents() {
   $("btn-add-videos").addEventListener("click", addVideosHandler);
   $("btn-add-videos-hero").addEventListener("click", addVideosHandler);
 
-  // Download Modal (YouTube / BiliBili)
-  const openDlModal = () => {
+  // Download Modal (YouTube / BiliBili). The download runs on the server: closing the dialog does not stop it,
+  // reopening re-attaches to it (GET /api/download/active), "Dừng tải" cancels it.
+  const DL_START_LABEL = "⬇ Tải Video + Sub gốc về danh sách";
+  const setDlRunning = (running) => {
+    $("btn-start-dl").disabled = running;
+    $("btn-start-dl").textContent = running ? "⏳ Đang tải..." : DL_START_LABEL;
+    $("btn-stop-dl").classList.toggle("hidden", !running);
+  };
+  const showDlStatus = (st) => {
+    const stBox = $("dl-status-box");
+    stBox.classList.remove("hidden");
+    const took = st.started ? ((st.ended || st.now || Date.now() / 1000) - st.started) : 0;
+    stBox.textContent = `[${Math.round(st.progress)}%] ${cleanUiText(st.message)}${st.started ? `  ⏱ ${fmtDur(took)}` : ""}`;
+  };
+  const attachDlJob = (jobId) => {
+    state.dlJobId = jobId;
+    setDlRunning(true);
+    clearInterval(state.dlPollTimer);
+    state.dlPollTimer = setInterval(async () => {
+      try {
+        const st = await api(`/api/download/${jobId}/status`);
+        showDlStatus(st);
+        if (st.status === "done") {
+          clearInterval(state.dlPollTimer);
+          setDlRunning(false);
+          state.dlJobId = null;
+          if (st.project && !state.projects.some((p) => p.id === st.project.id)) {
+            state.projects.push(st.project);
+            renderVideoList();
+            selectProject(st.project.id);
+          }
+        } else if (st.status === "error" || st.status === "stopped") {
+          clearInterval(state.dlPollTimer);
+          setDlRunning(false);
+          state.dlJobId = null;
+        }
+      } catch {
+        clearInterval(state.dlPollTimer);
+        setDlRunning(false);
+      }
+    }, 700);
+  };
+  const openDlModal = async () => {
     $("dl-modal").classList.remove("hidden");
-    $("dl-status-box").classList.add("hidden");
+    try {
+      const { job } = await api("/api/download/active");
+      if (job) {
+        showDlStatus(job);
+        attachDlJob(job.job_id);
+        return;
+      }
+    } catch {}
+    if (!state.dlJobId) {
+      setDlRunning(false);
+      $("dl-status-box").classList.add("hidden");
+    }
   };
   const closeDlModal = () => $("dl-modal").classList.add("hidden");
   $("btn-open-dl-modal").addEventListener("click", openDlModal);
@@ -1096,6 +1695,16 @@ function bindStaticEvents() {
   $("btn-cancel-dl").addEventListener("click", closeDlModal);
   $("dl-clean-ai").addEventListener("change", (e) => {
     $("dl-ai-opts").classList.toggle("hidden", !e.target.checked);
+    $("dl-ai-batch").classList.toggle("hidden", !e.target.checked);
+  });
+  $("btn-stop-dl").addEventListener("click", async () => {
+    if (!state.dlJobId) return;
+    $("btn-stop-dl").disabled = true;
+    try {
+      await api(`/api/download/${state.dlJobId}/cancel`, { method: "POST" });
+    } finally {
+      $("btn-stop-dl").disabled = false;
+    }
   });
 
   $("btn-start-dl").addEventListener("click", async () => {
@@ -1103,9 +1712,8 @@ function bindStaticEvents() {
     if (!url) return alert("Vui lòng dán link YouTube hoặc BiliBili!");
     const stBox = $("dl-status-box");
     stBox.classList.remove("hidden");
-    stBox.textContent = "Đang khởi tạo tải đa luồng...";
-    $("btn-start-dl").disabled = true;
-
+    stBox.textContent = "Đang phân tích link video...";
+    setDlRunning(true);
     try {
       const job = await api("/api/download", {
         method: "POST",
@@ -1119,39 +1727,15 @@ function bindStaticEvents() {
           clean_srt_ai: $("dl-clean-ai").checked,
           clean_model: $("dl-clean-model").value,
           clean_thinking_level: $("dl-clean-thinking").value,
+          clean_batch_lines: Number($("dl-clean-batch").value) || 0,
           api_key: $("tr-api-key").value || "",
           preset_id: $("preset-select").value || null,
         }),
       });
-
-      clearInterval(state.dlPollTimer);
-      state.dlPollTimer = setInterval(async () => {
-        try {
-          const st = await api(`/api/download/${job.job_id}/status`);
-          const cleanMsg = cleanUiText(st.message);
-          stBox.textContent = `[${Math.round(st.progress)}%] ${cleanMsg}`;
-          if (st.status === "done") {
-            clearInterval(state.dlPollTimer);
-            $("btn-start-dl").disabled = false;
-            if (st.project) {
-              state.projects.push(st.project);
-              renderVideoList();
-              selectProject(st.project.id);
-            }
-            setTimeout(() => closeDlModal(), 900);
-          } else if (st.status === "error") {
-            clearInterval(state.dlPollTimer);
-            $("btn-start-dl").disabled = false;
-            stBox.textContent = `[${Math.round(st.progress)}%] ${cleanMsg}`;
-          }
-        } catch {
-          clearInterval(state.dlPollTimer);
-          $("btn-start-dl").disabled = false;
-        }
-      }, 700);
+      attachDlJob(job.job_id);
     } catch (e) {
       stBox.textContent = `Lỗi: ${cleanUiText(e.message)}`;
-      $("btn-start-dl").disabled = false;
+      setDlRunning(false);
     }
   });
 
@@ -1478,6 +2062,21 @@ function bindStaticEvents() {
     startStatusPolling(proj.id);
   });
 
+  $("btn-translate-clear").addEventListener("click", async () => {
+    const proj = activeProject();
+    if (!proj) return;
+    if (!confirm(`Xóa tiến trình dịch của "${proj.name}"?\nLần dịch sau sẽ bắt đầu lại từ dòng 1. (Không tự chạy dịch.)`)) return;
+    const sg = confirm("Xóa luôn Style Guide (nhân vật, xưng hô, văn phong)?\n\nOK = xóa (lần sau phân tích lại)\nCancel = giữ Style Guide");
+    try {
+      const r = await api(`/api/projects/${proj.id}/translate-checkpoint?style_guide=${sg}`, { method: "DELETE" });
+      showToast(`Đã xóa tiến trình dịch (${r.removed_lines} dòng)` + (r.style_guide_removed ? " và Style Guide." : ", giữ Style Guide."), "info", 5000);
+      await loadProjects();
+      await loadStyleGuideInfo(proj.id);
+    } catch (e) {
+      showToast(e.message, "err", 8000);
+    }
+  });
+
   $("btn-clean-srt-rules").addEventListener("click", async () => {
     const proj = activeProject();
     if (!proj) return alert("Hãy chọn video có file SRT gốc!");
@@ -1498,6 +2097,7 @@ function bindStaticEvents() {
         use_ai: true,
         model: $("clean-srt-model").value,
         thinking_level: $("clean-srt-thinking").value,
+        batch_lines: Number($("clean-srt-batch").value) || 0,
         api_key: $("tr-api-key").value || "",
       }),
     });
@@ -1548,9 +2148,11 @@ function bindStaticEvents() {
           tiktok_session_id: $("voice-tiktok-sid").value || "",
           fallback_edge_tts: $("voice-fallback-edge").checked,
         };
-    if (!cfg.voice_id) return alert("Hãy chọn một giọng đọc trong danh sách trước!");
+    const higgs = cfg.provider === "higgs3";
+    if (higgs && !cfg.higgs_ref_audio) return showToast("Higgs TTS 3: hãy chọn file giọng mẫu trước.", "warn");
+    if (!higgs && !cfg.voice_id) return alert("Hãy chọn một giọng đọc trong danh sách trước!");
     const btn = $("btn-preview-voice");
-    btn.textContent = "⏳ Đang tạo mẫu...";
+    btn.textContent = higgs ? "⏳ Higgs: chuẩn bị giọng mẫu + bật máy chủ (lần đầu ~1–2 phút)..." : "⏳ Đang tạo mẫu...";
     btn.disabled = true;
     try {
       const sampleByLang = {
@@ -1576,6 +2178,7 @@ function bindStaticEvents() {
       player.play();
       const used = res.headers.get("X-TTS-Provider-Used") || "";
       $("render-status-text").textContent = `Đang phát thử giọng (${used})`;
+      if (higgs) refreshHiggsStatus();
     } catch (e) {
       alert(`Lỗi nghe thử giọng: ${e.message}`);
     } finally {
@@ -1597,13 +2200,98 @@ function bindStaticEvents() {
     $(id).addEventListener(ev, (e) => {
       const proj = activeProject();
       if (!proj) return;
-      fn(proj, e.target);
+      const el = e.target;
+      // number inputs do not stop typing above max (e.g. 500 in a max=120 field): clamp, so the saved config
+      // is always valid (an out-of-range value made EVERY save fail with HTTP 422 and blocked all buttons).
+      if (el.type === "number" && el.value !== "") {
+        const v = Number(el.value);
+        const lo = el.min !== "" ? Number(el.min) : -Infinity;
+        const hi = el.max !== "" ? Number(el.max) : Infinity;
+        if (!Number.isNaN(v) && (v < lo || v > hi)) {
+          const c = Math.min(hi, Math.max(lo, v));
+          if (ev === "change" || v > hi) {
+            el.value = String(c);
+            showToast(`Giá trị ${v} vượt giới hạn (${el.min}–${el.max}), đã chỉnh thành ${c}.`, "warn", 5000);
+          }
+        }
+      }
+      fn(proj, el);
       scheduleAutoSave();
     });
   };
 
   bind("sub-enabled", "change", (p, el) => { p.config.subtitle.enabled = el.checked; syncSubtitleVisual(); });
   bind("sub-font-select", "change", (p, el) => { p.config.subtitle.font_path = el.value; syncSubtitleVisual(); });
+  bind("sub-effect", "change", (p, el) => { p.config.subtitle.effect = el.value; syncSubtitleVisual(); });
+  bind("sub-effect-dur", "input", (p, el) => {
+    p.config.subtitle.effect_duration = Number(el.value);
+    $("val-sub-fx-dur").textContent = `${Number(el.value).toFixed(2)}s`;
+  });
+
+  // text-logo / watermark regions
+  bind("wm-enabled", "change", (p, el) => {
+    p.config.wm_removal.enabled = el.checked;
+    if (el.checked) selectLayer("wm", 0);
+    syncWmVisual();
+  });
+  bind("wm-mode", "change", (p, el) => {
+    p.config.wm_removal.mode = el.value;
+    $("wm-blur-opts").classList.toggle("hidden", el.value !== "blur");
+    syncWmVisual();
+  });
+  bind("wm-blur", "input", (p, el) => { p.config.wm_removal.blur_strength = Number(el.value); $("val-wm-blur").textContent = el.value; });
+  $("btn-wm-add").addEventListener("click", () => {
+    const p = activeProject();
+    if (!p) return;
+    const boxes = (p.config.wm_removal.boxes = p.config.wm_removal.boxes || []);
+    // new box: top-right first, then top-left, then stacked below
+    const presets = [
+      { x: 0.7, y: 0.02, w: 0.28, h: 0.07 },
+      { x: 0.02, y: 0.02, w: 0.28, h: 0.07 },
+    ];
+    boxes.push({ ...(presets[boxes.length] || { x: 0.36, y: 0.02 + 0.08 * (boxes.length - 2), w: 0.28, h: 0.07 }) });
+    p.config.wm_removal.enabled = true;
+    $("wm-enabled").checked = true;
+    state.activeWmIdx = boxes.length - 1;
+    syncWmVisual();
+    selectLayer("wm", boxes.length - 1);
+    scheduleAutoSave();
+  });
+  $("wm-list").addEventListener("click", (e) => {
+    const p = activeProject();
+    if (!p) return;
+    const del = e.target.closest(".btn-wm-del");
+    if (del) {
+      p.config.wm_removal.boxes.splice(Number(del.dataset.idx), 1);
+      state.activeWmIdx = 0;
+      syncWmVisual();
+      renderWmList();
+      scheduleAutoSave();
+      return;
+    }
+    const row = e.target.closest(".wm-row");
+    if (row) selectLayer("wm", Number(row.dataset.idx));
+  });
+
+  // channel name
+  const chBind = (id, ev, fn) => bind(id, ev, (p, el) => { fn(p.config.channel_text, el); syncChannelVisual(); });
+  chBind("ch-enabled", "change", (c, el) => { c.enabled = el.checked; if (el.checked) selectLayer("channel"); });
+  chBind("ch-text", "input", (c, el) => { c.text = el.value; });
+  chBind("ch-font", "change", (c, el) => { c.font_path = el.value; });
+  chBind("ch-size", "input", (c, el) => { c.font_size = Number(el.value); $("val-ch-size").textContent = `${el.value}px`; });
+  chBind("ch-outline", "input", (c, el) => { c.outline_width = Number(el.value); $("val-ch-outline").textContent = `${el.value}px`; });
+  chBind("ch-color", "input", (c, el) => { c.text_color = el.value; });
+  chBind("ch-outline-color", "input", (c, el) => { c.outline_color = el.value; });
+  chBind("ch-bg-enabled", "change", (c, el) => { c.bg_enabled = el.checked; });
+  chBind("ch-bold", "change", (c, el) => { c.bold = el.checked; });
+  chBind("ch-bg-color", "input", (c, el) => { c.bg_color = el.value; });
+  chBind("ch-bg-opacity", "input", (c, el) => { c.bg_opacity = Number(el.value); $("val-ch-bg-op").textContent = `${Math.round(el.value * 100)}%`; });
+  chBind("ch-radius", "input", (c, el) => { c.border_radius = Number(el.value); $("val-ch-radius").textContent = `${el.value}px`; });
+  chBind("ch-effect", "change", (c, el) => {
+    c.effect = el.value;
+    $("ch-period-field").classList.toggle("hidden", !["shimmer", "slide_in", "typewriter"].includes(el.value));
+  });
+  chBind("ch-period", "change", (c, el) => { c.effect_period_sec = Math.max(2, Math.min(120, Number(el.value) || 8)); });
   bind("sub-size", "input", (p, el) => { p.config.subtitle.font_size = Number(el.value); $("val-sub-size").textContent = `${el.value}px`; syncSubtitleVisual(); });
   bind("sub-outline", "input", (p, el) => { p.config.subtitle.outline_width = Number(el.value); $("val-sub-outline").textContent = `${el.value}px`; syncSubtitleVisual(); });
   bind("sub-color", "input", (p, el) => { p.config.subtitle.text_color = el.value; syncSubtitleVisual(); });
@@ -1671,10 +2359,20 @@ function bindStaticEvents() {
 
   bind("tr-src-lang", "change", (p, el) => { p.config.translate.source_lang = el.value; });
   bind("tr-tgt-lang", "change", (p, el) => { p.config.translate.target_lang = el.value; });
-  bind("tr-provider", "change", (p, el) => { p.config.translate.provider = el.value; });
+  bind("tr-provider", "change", (p, el) => { p.config.translate.provider = el.value; syncProviderUi(); });
+  bind("tr-web-mode", "change", (p, el) => { p.config.translate.web_mode = el.value; syncProviderUi(); });
+  bind("tr-web-chunk", "input", (p, el) => {
+    p.config.translate.web_chunk_lines = Math.max(20, Math.min(3000, Number(el.value) || 250));
+    updateWebPlan();
+  });
+  bind("tr-web-newchat", "change", (p, el) => { p.config.translate.web_new_chat = el.checked; });
   bind("tr-model", "change", (p, el) => { p.config.translate.model = el.value; });
   bind("tr-thinking", "change", (p, el) => { p.config.translate.thinking_level = el.value; });
-  bind("tr-batch", "input", (p, el) => { p.config.translate.batch_size = Number(el.value) || 45; });
+  bind("tr-whole-file", "change", (p, el) => {
+    p.config.translate.whole_file = el.checked;
+    syncProviderUi();
+  });
+  bind("tr-batch", "input", (p, el) => { p.config.translate.batch_size = Math.max(10, Math.min(2000, Number(el.value) || 45)); });
   bind("tr-tol", "input", (p, el) => { p.config.translate.length_tolerance_pct = Number(el.value) || 15; });
   bind("tr-api-key", "input", (p, el) => { p.config.translate.api_key = el.value; });
   bind("tr-concurrency", "input", (p, el) => {
@@ -1692,6 +2390,11 @@ function bindStaticEvents() {
       p.config.voice.include_multilingual = multi;
       scheduleAutoSave();
     }
+    syncVoiceProviderUi(prov);
+    if (prov === "higgs3") {
+      if (p) refreshReviewButton(p.id);
+      return;
+    }
     await loadVoices(prov, lang, multi);
   };
   $("voice-provider").addEventListener("change", refreshVoiceList);
@@ -1704,13 +2407,540 @@ function bindStaticEvents() {
     if (found) p.config.voice.voice_name = found.name;
   });
   bind("voice-speed", "input", (p, el) => { p.config.voice.speed = Number(el.value); $("val-voice-speed").textContent = `${Number(el.value).toFixed(2)}x`; });
-  bind("voice-concurrency", "input", (p, el) => { p.config.voice.concurrency = Number(el.value); $("val-voice-conc").textContent = `${el.value} luồng`; });
+  bind("voice-concurrency", "input", (p, el) => {
+    const n = Math.max(1, Math.min(500, Number(el.value) || 1));
+    p.config.voice.concurrency = n;
+    const cap = { capcut_tiktok: 32, gtts: 16 }[p.config.voice.provider];
+    $("val-voice-conc").textContent = cap && n > cap ? `${n} → dùng ${cap} luồng (giới hạn nguồn này)` : `${n} luồng`;
+  });
   bind("voice-tiktok-sid", "input", (p, el) => { p.config.voice.tiktok_session_id = el.value; });
   bind("voice-fallback-edge", "change", (p, el) => { p.config.voice.fallback_edge_tts = el.checked; });
+
+  bindHiggsEvents(bind);
 
   // Render buttons
   $("btn-render-sample").addEventListener("click", () => triggerRender(8.0));
   $("btn-render-full").addEventListener("click", () => triggerRender(null));
+}
+
+
+// ---------------- LENGTH FIT + HIGGS TTS 3 + VOICE REVIEW TABLE ----------------
+
+const HIGGS_FOLDER_KEY = "higgsRefFolder";
+const VR = { rows: [], page: 0, per: 100, edits: {}, pollTimer: null, projectId: null, counts: null };
+
+function escHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function fmtTime(sec) {
+  const s = Math.max(0, Number(sec) || 0);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = (s % 60).toFixed(1);
+  return `${h ? h + ":" : ""}${String(m).padStart(h ? 2 : 1, "0")}:${r.padStart(4, "0")}`;
+}
+
+function mediaUrl(path) {
+  return `/api/media/stream?path=${encodeURIComponent(path)}&t=${Date.now()}`;
+}
+
+function syncVoiceProviderUi(prov) {
+  const higgs = prov === "higgs3";
+  $("voice-std-box").classList.toggle("hidden", higgs);
+  $("higgs-box").classList.toggle("hidden", !higgs);
+  if (higgs) refreshHiggsStatus();
+}
+
+function applyHiggsConfig(c) {
+  const v = c.voice;
+  $("tr-fit-timing").checked = c.translate.fit_timing ?? true;
+  $("voice-auto-fit").checked = v.auto_fit ?? true;
+  $("higgs-ref").value = v.higgs_ref_audio || "";
+  $("higgs-ref-text").value = v.higgs_ref_text || "";
+  $("higgs-clean").checked = v.higgs_clean_ref ?? true;
+  $("higgs-clean-strong").checked = !!v.higgs_clean_strong;
+  $("higgs-review").checked = v.higgs_review ?? true;
+  $("higgs-retry").value = String(v.higgs_auto_retry ?? 1);
+  $("higgs-pause").checked = v.higgs_pause_review ?? true;
+  $("higgs-ref-result").classList.add("hidden");
+  syncVoiceProviderUi(v.provider);
+}
+
+async function refreshLengthReport(projectId) {
+  const el = $("tr-length-report");
+  try {
+    const r = await api(`/api/projects/${projectId}/length-report`);
+    if (!r.checked) {
+      el.textContent = "Độ dài bản dịch: chưa có bản dịch";
+      el.className = "fit-report";
+      return;
+    }
+    const pct = Math.round((100 * r.over) / r.checked);
+    el.textContent = r.over
+      ? `⚠ ${r.over}/${r.checked} câu (${pct}%) dài quá khung · cả bài cần đọc nhanh ${r.ratio}x`
+      : `✓ Cả ${r.checked} câu vừa khung thời gian (${r.ratio}x)`;
+    el.className = `fit-report ${r.over ? "bad" : "good"}`;
+  } catch {
+    el.textContent = "";
+  }
+}
+
+async function refreshHiggsStatus(refresh = false) {
+  const el = $("higgs-status");
+  try {
+    const s = await api(`/api/higgs/status${refresh ? "?refresh=true" : ""}`);
+    if (!s.ok) {
+      el.textContent = !s.scripts
+        ? "⚠ Không thấy script Higgs ở D:\\Download\\Model"
+        : "⚠ Chưa cài Higgs TTS 3 trong WSL (Ubuntu: /root/higgs3)";
+      el.className = "fit-report bad";
+      return;
+    }
+    const env = s.env || {};
+    const envTxt = env.python_whisper ? "" : " · ⚠ thiếu môi trường Whisper (envs\\giong_sach)";
+    el.textContent = (s.alive ? `● Máy chủ Higgs đang chạy (${s.config || "?"}, giữ ~12GB VRAM)` : "○ Máy chủ Higgs đang tắt (tự bật khi tạo voice, ~1 phút)")
+      + (s.gpu ? ` · ${s.gpu}` : "") + envTxt;
+    el.className = `fit-report ${s.alive ? "good" : ""}`;
+  } catch (e) {
+    el.textContent = `Không đọc được trạng thái Higgs: ${e.message}`;
+  }
+}
+
+async function loadHiggsRefFolder(folder) {
+  const list = $("higgs-ref-list");
+  if (!folder) return;
+  localStorage.setItem(HIGGS_FOLDER_KEY, folder);
+  const r = await api(`/api/higgs/refs?folder=${encodeURIComponent(folder)}`);
+  state.higgsRefs = r.refs || [];
+  $("higgs-ref-count").textContent = String(state.higgsRefs.length);
+  list.innerHTML = state.higgsRefs
+    .map((x) => `<option value="${escHtml(x.path)}">${escHtml(x.name)}${x.text ? " — có lời" : " — chưa có lời (.txt)"}</option>`)
+    .join("");
+  const cur = $("higgs-ref").value;
+  if (cur && state.higgsRefs.some((x) => x.path === cur)) list.value = cur;
+}
+
+// lines shortened / edited after the voice was made: their voice still reads the OLD text
+async function refreshVoicePending(projectId) {
+  const row = $("voice-pending-row");
+  try {
+    const r = await api(`/api/projects/${projectId}/voice-pending`);
+    if (state.activeProjectId !== projectId) return;
+    const show = r.has_voice && r.pending > 0;
+    row.classList.toggle("hidden", !show);
+    if (show) {
+      $("voice-pending-text").textContent =
+        `⚠ ${r.pending} câu đã đổi chữ (rút gọn / sửa) sau lần tạo voice trước — voice vẫn đọc chữ cũ`;
+      $("btn-voice-pending").textContent = `🔄 Tạo voice cho ${r.pending} câu đã đổi chữ`;
+    }
+  } catch {
+    row.classList.add("hidden");
+  }
+}
+
+async function runPendingVoices(projectId) {
+  const p = state.projects.find((x) => x.id === projectId);
+  if (!p) return;
+  try {
+    await flushSave(p);
+    if (p.config.voice.provider === "higgs3") {
+      // Higgs: only those lines (server stays on for <= 40 lines, Whisper hears the new versions)
+      const r = await api(`/api/projects/${projectId}/voice-review/regen`, {
+        method: "POST",
+        body: JSON.stringify({ indices: [], pending: true }),
+      });
+      showToast(`Đang tạo voice cho ${r.count} câu đã đổi chữ...`, "info", 5000);
+      if (!$("vr-modal").classList.contains("hidden") && VR.projectId === projectId) watchReviewJob();
+    } else {
+      // other voices: the whole step runs again, unchanged lines come from the cache (no new request)
+      await api(`/api/projects/${projectId}/voices`, { method: "POST" });
+      showToast("Đang tạo voice cho các câu đã đổi chữ (câu khác lấy lại từ cache)...", "info", 5000);
+    }
+    startStatusPolling(projectId);
+  } catch (e) {
+    showToast(`Không tạo được voice: ${e.message}`);
+  }
+}
+
+async function refreshReviewButton(projectId) {
+  refreshVoicePending(projectId);
+  const p = state.projects.find((x) => x.id === projectId);
+  const btn = $("btn-voice-review");
+  if (!p || p.config.voice.provider !== "higgs3") {
+    btn.textContent = "📋 Bảng kiểm tra voice";
+    btn.classList.remove("has-bad");
+    return;
+  }
+  try {
+    const r = await api(`/api/projects/${projectId}/voice-review?show=flagged`);
+    const c = r.counts || {};
+    btn.textContent = c.total
+      ? `📋 Bảng kiểm tra voice — ${c.flagged} câu nghi ngờ / ${c.total} câu`
+      : "📋 Bảng kiểm tra voice (chưa tạo voice Higgs)";
+    btn.classList.toggle("has-bad", (c.flagged || 0) > 0);
+  } catch {
+    /* ignore */
+  }
+}
+
+// called when a job of a project ends (single-job polling or batch polling)
+function afterJobRefresh(projectId, st) {
+  if (state.activeProjectId !== projectId) return;
+  refreshLengthReport(projectId);
+  refreshReviewButton(projectId);
+  if (!$("vr-modal").classList.contains("hidden") && VR.projectId === projectId) loadReviewRows();
+  const msg = (st && st.status_message) || "";
+  if (msg.startsWith("⏸")) {
+    showToast(msg, "warn", 12000);
+    openReviewModal();
+  }
+}
+
+// ---------- review modal ----------
+function reviewFiltered() {
+  const q = ($("vr-search").value || "").trim().toLowerCase();
+  if (!q) return VR.rows;
+  return VR.rows.filter((r) => `${r.text} ${r.heard || ""} ${r.source || ""} ${r.index}`.toLowerCase().includes(q));
+}
+
+function markHeard(text, heard) {
+  if (!heard) return '<span class="vr-time">(chưa nghe / không nghe ra lời)</span>';
+  const norm = (w) => w.toLowerCase().replace(/[^\p{L}\p{N}']+/gu, "");
+  const ref = new Set(text.split(/[\s-]+/).map(norm).filter(Boolean));
+  return heard
+    .split(/(\s+)/)
+    .map((w) => (w.trim() && !ref.has(norm(w)) && norm(w) ? `<mark>${escHtml(w)}</mark>` : escHtml(w)))
+    .join("");
+}
+
+function renderReviewTable() {
+  const rows = reviewFiltered();
+  const pages = Math.max(1, Math.ceil(rows.length / VR.per));
+  VR.page = Math.min(VR.page, pages - 1);
+  const slice = rows.slice(VR.page * VR.per, (VR.page + 1) * VR.per);
+  $("vr-tbody").innerHTML = slice.length
+    ? slice
+        .map((r) => {
+          const ed = VR.edits[r.index];
+          const cls = `${r.flag ? "vr-flag" : ""} ${r.ok && !r.stale ? "vr-ok" : ""} ${r.stale ? "vr-stale" : ""}`;
+          const versions = (r.tries || [])
+            .map((t) => `<option value="${t.t}" ${t.t === r.sel ? "selected" : ""}>Bản ${t.t + 1}${t.flag ? " ⚠" : " ✓"}</option>`)
+            .join("");
+          const okTxt = r.ok_by === "ai" ? "✓ AI đánh dấu OK (Whisper nghe nhầm)" : "Đã đánh dấu OK";
+          let reasons = r.reasons && r.reasons.length
+            ? `<ul class="vr-reasons">${r.reasons.map((x) => `<li>${escHtml(x)}</li>`).join("")}</ul>`
+            : (r.ok ? `<span class="vr-time">${okTxt}</span>` : '<span class="vr-time">—</span>');
+          if (r.ok && r.reasons && r.reasons.length) reasons += `<div class="vr-time">${okTxt}</div>`;
+          if (r.ai && !r.stale) {
+            const k = { OK: "ok", SAI: "bad" }[r.ai.verdict] || "unsure";
+            const lbl = { OK: "Whisper nghe nhầm", SAI: "Đọc sai thật", NGHI: "Cần nghe" }[r.ai.verdict] || r.ai.verdict;
+            reasons += `<div class="vr-ai ${k}">🤖 ${lbl}${r.ai.note ? ` — ${escHtml(r.ai.note)}` : ""}</div>`;
+          }
+          if (r.stale) {
+            reasons = `<div class="vr-stale-note">✏ Chữ đã đổi sau khi tạo voice — voice hiện tại vẫn đọc: «${escHtml(r.voiced_text)}». Bấm 🔄 hoặc ↻ để tạo voice mới.</div>`;
+          }
+          return `<tr class="${cls}" data-idx="${r.index}">
+            <td><input type="checkbox" class="vr-chk" data-idx="${r.index}" /></td>
+            <td><b>${r.index}</b><div class="vr-time">${fmtTime(r.start)}</div><div class="vr-time">${(r.dur || 0).toFixed(1)}s / ${(r.allow || 0).toFixed(1)}s</div></td>
+            <td><textarea class="vr-text ${ed !== undefined ? "edited" : ""}" data-idx="${r.index}">${escHtml(ed !== undefined ? ed : r.text)}</textarea>
+                ${r.source ? `<div class="vr-src">${escHtml(r.source)}</div>` : ""}</td>
+            <td class="vr-heard">${markHeard(r.voiced_text || r.text, r.heard)}</td>
+            <td>${reasons}</td>
+            <td><button class="btn btn-sm vr-play" data-wav="${escHtml(r.wav || "")}" ${r.wav ? "" : "disabled"}>▶</button></td>
+            <td>${versions ? `<select class="vr-ver" data-idx="${r.index}">${versions}</select>` : ""}</td>
+            <td><button class="btn btn-sm vr-regen" data-idx="${r.index}">↻</button></td>
+          </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="8" style="text-align:center;padding:18px;color:var(--text-2);">${
+        VR.rows.length ? "Không có câu khớp ô tìm." : "Không có câu nghi ngờ nào 🎉"
+      }</td></tr>`;
+  $("vr-page-info").textContent = `${rows.length} câu · trang ${VR.page + 1}/${pages}`;
+  const c = VR.counts || {};
+  $("vr-counts").textContent = `${c.flagged ?? 0} nghi ngờ · ${c.accepted ?? 0} đã OK · ${c.total ?? 0} câu`
+    + (c.unchecked ? ` · ${c.unchecked} chưa nghe` : "")
+    + (c.stale ? ` · ${c.stale} câu đổi chữ chưa có voice mới` : "");
+  $("vr-check-all").checked = false;
+  const pb = $("btn-vr-pending");
+  pb.classList.toggle("hidden", !c.stale);
+  pb.textContent = `🔄 Tạo voice ${c.stale || 0} câu đã đổi chữ`;
+  const nBad = VR.rows.filter((r) => !r.stale && r.flag && r.ai && r.ai.verdict === "SAI").length;
+  const bb = $("btn-vr-ai-bad");
+  bb.classList.toggle("hidden", !nBad);
+  bb.textContent = `↻ Tạo lại ${nBad} câu AI báo sai`;
+}
+
+async function loadReviewRows() {
+  if (!VR.projectId) return;
+  const r = await api(`/api/projects/${VR.projectId}/voice-review?show=${$("vr-show").value}`);
+  VR.rows = r.rows || [];
+  VR.counts = r.counts || {};
+  renderReviewTable();
+}
+
+async function openReviewModal() {
+  const p = activeProject();
+  if (!p) return showToast("Hãy chọn một video trước.");
+  VR.projectId = p.id;
+  VR.edits = {};
+  VR.page = 0;
+  $("vr-title").textContent = p.name;
+  $("vr-modal").classList.remove("hidden");
+  $("vr-tbody").innerHTML = '<tr><td colspan="8" style="padding:18px;">Đang tải...</td></tr>';
+  try {
+    await loadReviewRows();
+  } catch (e) {
+    showToast(`Không tải được bảng kiểm tra: ${e.message}`);
+  }
+  if (["voicing"].includes(p.status)) watchReviewJob();
+}
+
+function selectedReviewIdx() {
+  return [...document.querySelectorAll(".vr-chk:checked")].map((x) => Number(x.dataset.idx));
+}
+
+function watchReviewJob() {
+  clearInterval(VR.pollTimer);
+  const box = $("vr-progress");
+  box.classList.remove("hidden");
+  VR.pollTimer = setInterval(async () => {
+    try {
+      const st = await api(`/api/projects/${VR.projectId}/status`);
+      box.textContent = `⏳ ${st.status_message || st.status} (${Math.round(st.progress)}%)`;
+      if (["ready", "done", "error"].includes(st.status)) {
+        clearInterval(VR.pollTimer);
+        box.classList.toggle("hidden", st.status !== "error");
+        if (st.status === "error") box.textContent = st.status_message;
+        else if (VR.toastOnDone && st.status_message) showToast(st.status_message, "info", 12000);
+        VR.toastOnDone = false;
+        await loadReviewRows();
+        refreshReviewButton(VR.projectId);
+        refreshHiggsStatus();
+      }
+    } catch {
+      clearInterval(VR.pollTimer);
+    }
+  }, 1000);
+}
+
+async function regenReview(indices, allFlagged = false, extra = {}) {
+  const edits = {};
+  for (const [k, v] of Object.entries(VR.edits)) {
+    if (allFlagged || indices.includes(Number(k))) edits[k] = v;
+  }
+  const hasExtra = Object.values(extra).some(Boolean);
+  if (!indices.length && !allFlagged && !hasExtra && !Object.keys(edits).length) return showToast("Chưa chọn câu nào.", "warn");
+  try {
+    const r = await api(`/api/projects/${VR.projectId}/voice-review/regen`, {
+      method: "POST",
+      body: JSON.stringify({ indices, all_flagged: allFlagged, edits, ...extra }),
+    });
+    for (const k of Object.keys(edits)) delete VR.edits[k];
+    showToast(`Đang tạo lại ${r.count} câu (máy chủ Higgs tắt thì cần ~1 phút để bật)...`, "info", 5000);
+    watchReviewJob();
+    startStatusPolling(VR.projectId);
+  } catch (e) {
+    showToast(`Không tạo lại được: ${e.message}`);
+  }
+}
+
+function bindHiggsEvents(bind) {
+  bind("tr-fit-timing", "change", (p, el) => { p.config.translate.fit_timing = el.checked; });
+  bind("voice-auto-fit", "change", (p, el) => { p.config.voice.auto_fit = el.checked; });
+  bind("higgs-ref", "change", (p, el) => { p.config.voice.higgs_ref_audio = el.value.trim(); });
+  bind("higgs-ref-text", "input", (p, el) => { p.config.voice.higgs_ref_text = el.value; });
+  bind("higgs-clean", "change", (p, el) => { p.config.voice.higgs_clean_ref = el.checked; });
+  bind("higgs-clean-strong", "change", (p, el) => { p.config.voice.higgs_clean_strong = el.checked; });
+  bind("higgs-review", "change", (p, el) => { p.config.voice.higgs_review = el.checked; });
+  bind("higgs-retry", "change", (p, el) => { p.config.voice.higgs_auto_retry = Number(el.value) || 0; });
+  bind("higgs-pause", "change", (p, el) => { p.config.voice.higgs_pause_review = el.checked; });
+
+  const folder = localStorage.getItem(HIGGS_FOLDER_KEY) || "D:\\Download\\Youtube\\Voice\\Mau";
+  $("higgs-ref-folder").value = folder;
+  loadHiggsRefFolder(folder).catch(() => {});
+  $("btn-higgs-folder").addEventListener("click", () => loadHiggsRefFolder($("higgs-ref-folder").value.trim()).catch((e) => showToast(e.message)));
+  $("higgs-ref-list").addEventListener("change", () => {
+    const ref = (state.higgsRefs || []).find((x) => x.path === $("higgs-ref-list").value);
+    const p = activeProject();
+    if (!ref || !p) return;
+    $("higgs-ref").value = ref.path;
+    $("higgs-ref-text").value = ref.text || "";
+    p.config.voice.higgs_ref_audio = ref.path;
+    p.config.voice.higgs_ref_text = ref.text || "";
+    $("higgs-ref-result").classList.add("hidden");
+    scheduleAutoSave();
+  });
+  $("btn-higgs-pick").addEventListener("click", async () => {
+    const r = await api("/api/system/pick", { method: "POST", body: JSON.stringify({ mode: "file", kind: "audio" }) });
+    const path = (r.paths || [])[0];
+    const p = activeProject();
+    if (!path || !p) return;
+    $("higgs-ref").value = path;
+    p.config.voice.higgs_ref_audio = path;
+    const ref = (state.higgsRefs || []).find((x) => x.path === path);
+    if (ref && ref.text) {
+      $("higgs-ref-text").value = ref.text;
+      p.config.voice.higgs_ref_text = ref.text;
+    }
+    scheduleAutoSave();
+  });
+  $("btn-higgs-stop").addEventListener("click", async () => {
+    try {
+      await api("/api/higgs/stop", { method: "POST" });
+      showToast("Đã tắt máy chủ Higgs (trả VRAM).", "info", 4000);
+    } catch (e) {
+      showToast(e.message);
+    }
+    refreshHiggsStatus();
+  });
+  $("btn-higgs-prepare").addEventListener("click", async () => {
+    const p = activeProject();
+    if (!p) return showToast("Hãy chọn một video trước.");
+    if (!p.config.voice.higgs_ref_audio) return showToast("Chưa chọn file giọng mẫu.", "warn");
+    const btn = $("btn-higgs-prepare");
+    const box = $("higgs-ref-result");
+    btn.disabled = true;
+    btn.textContent = "⏳ Đang lọc + cắt giọng mẫu (lần đầu ~1 phút)...";
+    try {
+      await flushSave(p);
+      const r = await api("/api/higgs/prepare-ref", { method: "POST", body: JSON.stringify({ config: p.config.voice }) });
+      const d0 = r.dnsmos_before || {}, d1 = r.dnsmos_after || {};
+      box.innerHTML = `
+        <div><b>Gốc</b> <audio controls src="${mediaUrl(r.source)}" style="width:100%;height:30px;"></audio></div>
+        ${r.full_clean ? `<div><b>Đã lọc (cả file)</b> <audio controls src="${mediaUrl(r.full_clean)}" style="width:100%;height:30px;"></audio></div>` : ""}
+        <div><b>Đoạn dùng để clone (${r.seconds ?? "?"}s)</b> <audio controls src="${mediaUrl(r.wav)}" style="width:100%;height:30px;"></audio></div>
+        <div style="margin-top:4px;">Chất lượng DNSMOS (1–5): tổng ${d0.OVRL ?? "?"} → <b>${d1.OVRL ?? "?"}</b> · giọng ${d0.SIG ?? "?"} → ${d1.SIG ?? "?"} · nền sạch ${d0.BAK ?? "?"} → ${d1.BAK ?? "?"}</div>
+        <ul style="margin:4px 0 0;padding-left:16px;">${(r.steps || []).map((x) => `<li>${escHtml(x)}</li>`).join("")}
+        ${(r.skipped || []).map((x) => `<li style="color:var(--text-2)">${escHtml(x)}</li>`).join("")}</ul>
+        ${(r.warnings || []).length ? `<div style="color:var(--warn);margin-top:4px;">⚠ ${r.warnings.map(escHtml).join("<br/>⚠ ")}</div>` : ""}
+        <div class="vr-time" style="margin-top:4px;">Lời đoạn clone: ${escHtml(r.text)}</div>`;
+      box.classList.remove("hidden");
+    } catch (e) {
+      showToast(`Lọc giọng mẫu lỗi: ${e.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "🎧 Lọc & nghe thử giọng mẫu (trước / sau)";
+    }
+  });
+
+  $("btn-fit-length").addEventListener("click", async () => {
+    const p = activeProject();
+    if (!p) return showToast("Hãy chọn một video trước.");
+    try {
+      await flushSave(p);
+      await api(`/api/projects/${p.id}/fit-length`, { method: "POST" });
+      startStatusPolling(p.id);
+      updateStopButton && updateStopButton();
+    } catch (e) {
+      showToast(e.message);
+    }
+  });
+
+  // review modal
+  $("btn-voice-review").addEventListener("click", openReviewModal);
+  $("btn-close-vr").addEventListener("click", () => {
+    $("vr-modal").classList.add("hidden");
+    $("vr-player").pause();
+    clearInterval(VR.pollTimer);
+  });
+  $("vr-show").addEventListener("change", () => { VR.page = 0; loadReviewRows(); });
+  $("vr-search").addEventListener("input", () => { VR.page = 0; renderReviewTable(); });
+  $("btn-vr-prev").addEventListener("click", () => { VR.page = Math.max(0, VR.page - 1); renderReviewTable(); });
+  $("btn-vr-next").addEventListener("click", () => { VR.page += 1; renderReviewTable(); });
+  $("vr-check-all").addEventListener("change", (e) => {
+    document.querySelectorAll(".vr-chk").forEach((x) => { x.checked = e.target.checked; });
+  });
+  $("vr-tbody").addEventListener("click", async (e) => {
+    const t = e.target;
+    if (t.classList.contains("vr-play")) {
+      const pl = $("vr-player");
+      document.querySelectorAll(".vr-table tr.vr-current").forEach((r) => r.classList.remove("vr-current"));
+      t.closest("tr").classList.add("vr-current");
+      pl.src = mediaUrl(t.dataset.wav);
+      pl.play().catch(() => {});
+    } else if (t.classList.contains("vr-regen")) {
+      regenReview([Number(t.dataset.idx)]);
+    }
+  });
+  $("vr-tbody").addEventListener("input", (e) => {
+    const t = e.target;
+    if (!t.classList.contains("vr-text")) return;
+    const row = VR.rows.find((r) => r.index === Number(t.dataset.idx));
+    if (row && t.value.trim() !== row.text.trim()) {
+      VR.edits[row.index] = t.value;
+      t.classList.add("edited");
+    } else if (row) {
+      delete VR.edits[row.index];
+      t.classList.remove("edited");
+    }
+  });
+  $("vr-tbody").addEventListener("change", async (e) => {
+    const t = e.target;
+    if (!t.classList.contains("vr-ver")) return;
+    try {
+      await api(`/api/projects/${VR.projectId}/voice-review/select`, {
+        method: "POST",
+        body: JSON.stringify({ index: Number(t.dataset.idx), t: Number(t.value) }),
+      });
+      await loadReviewRows();
+    } catch (err) {
+      showToast(err.message);
+    }
+  });
+  $("btn-vr-regen-sel").addEventListener("click", () => regenReview(selectedReviewIdx()));
+  $("btn-vr-regen-all").addEventListener("click", () => {
+    const n = (VR.counts || {}).flagged || 0;
+    if (!n && !Object.keys(VR.edits).length) return showToast("Không có câu nghi ngờ nào để tạo lại.", "info", 4000);
+    regenReview([], true);
+  });
+  const markOk = async (ok) => {
+    const idx = selectedReviewIdx();
+    if (!idx.length) return showToast("Chưa chọn câu nào.", "warn");
+    await api(`/api/projects/${VR.projectId}/voice-review/ok`, { method: "POST", body: JSON.stringify({ indices: idx, ok }) });
+    await loadReviewRows();
+    refreshReviewButton(VR.projectId);
+  };
+  $("btn-vr-ok-sel").addEventListener("click", () => markOk(true));
+  $("btn-vr-unok-sel").addEventListener("click", () => markOk(false));
+  $("btn-vr-pending").addEventListener("click", () => {
+    VR.toastOnDone = true;
+    regenReview([], false, { pending: true });
+  });
+  $("btn-vr-ai-bad").addEventListener("click", () => regenReview([], false, { ai_bad: true }));
+  $("btn-vr-ai").addEventListener("click", async () => {
+    const sel = selectedReviewIdx();
+    try {
+      await api(`/api/projects/${VR.projectId}/voice-review/ai-check`, {
+        method: "POST",
+        body: JSON.stringify({ indices: sel, recheck: sel.length > 0 }),
+      });
+      showToast(
+        sel.length
+          ? `AI đang soát ${sel.length} câu đã chọn...`
+          : "AI đang soát tất cả câu nghi ngờ chưa soát (Antigravity ~1–4 phút)...",
+        "info", 6000,
+      );
+      VR.toastOnDone = true;
+      watchReviewJob();
+      startStatusPolling(VR.projectId);
+    } catch (e) {
+      showToast(`Không gửi được cho AI: ${e.message}`);
+    }
+  });
+  $("btn-voice-pending").addEventListener("click", () => {
+    const p = activeProject();
+    if (p) runPendingVoices(p.id);
+  });
+  $("btn-vr-done").addEventListener("click", async () => {
+    if (Object.keys(VR.edits).length && !confirm("Có câu đã sửa chữ nhưng chưa bấm Tạo lại. Vẫn chạy tiếp (bỏ các chỗ sửa)?")) return;
+    try {
+      await api(`/api/projects/${VR.projectId}/voice-review/done`, { method: "POST" });
+      $("vr-modal").classList.add("hidden");
+      showToast("Đã ghi nhận kiểm tra xong — chạy tiếp ghép audio + xóa sub + xuất video.", "info", 6000);
+      startBatchPolling();
+    } catch (e) {
+      showToast(e.message);
+    }
+  });
 }
 
 init();

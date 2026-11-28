@@ -14,3 +14,6 @@ rapidocr-onnxruntime>=1.4.0
 onnxruntime-directml>=1.20.0  # CPU + DirectML (OCR on Intel iGPU / NVIDIA MX). Do NOT also install plain onnxruntime.
 yt-dlp>=2025.1.1
 gTTS>=2.5.0
+# NVIDIA (optional, installed by setup.bat from the CUDA index - NOT from PyPI, which ships CPU-only torch):
+#   torch==2.11.0+cu128 torchvision==0.26.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+#   onnx, onnx2torch (--no-deps)

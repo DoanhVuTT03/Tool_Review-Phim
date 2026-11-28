@@ -1,10 +1,18 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, List, Tuple
+import os
 from PIL import Image, ImageDraw, ImageFont
 
 from app.models import SubtitleConfig, SubtitleCue
+from app.services.effects import (
+    channel_loop_frames,
+    channel_margins,
+    subtitle_frame_counts,
+    subtitle_intro_frames,
+    subtitle_outro_frames,
+)
 
 
 def _hex_to_rgba(hex_color: str, alpha_float: float = 1.0) -> Tuple[int, int, int, int]:
@@ -91,14 +99,25 @@ def _wrap_text(
 
 def render_single_subtitle_png(
     text: str,
-    cfg: SubtitleConfig,
+    cfg: Any,
     box_w: int,
     box_h: int,
     out_path: Path,
     scale_factor: float = 1.0,
 ) -> None:
-    """Renders 1 subtitle cue onto an exact (box_w x box_h) transparent RGBA canvas.
-    Supports true rounded-corner background box, padding, stroke, alignment, and auto-fit if text overflows height.
+    render_subtitle_image(text, cfg, box_w, box_h, scale_factor).save(out_path, format="PNG", compress_level=1)
+
+
+def render_subtitle_image(
+    text: str,
+    cfg: Any,
+    box_w: int,
+    box_h: int,
+    scale_factor: float = 1.0,
+) -> Image.Image:
+    """Renders 1 subtitle cue (or the channel name: same style fields) onto an exact (box_w x box_h)
+    transparent RGBA canvas. Supports true rounded-corner background box, padding, stroke, alignment, and
+    auto-fit if text overflows height.
     """
     box_w = max(16, int(box_w))
     box_h = max(16, int(box_h))
@@ -169,7 +188,7 @@ def render_single_subtitle_png(
         )
         cur_y += step
 
-    img.save(out_path, format="PNG", compress_level=1)
+    return img
 
 
 def build_subtitle_concat_sequence(
@@ -179,6 +198,7 @@ def build_subtitle_concat_sequence(
     video_h: int,
     video_duration: float,
     work_dir: Path,
+    fps: float = 30.0,
 ) -> Tuple[Path, int, int, int, int]:
     """Generates RGBA PNGs for all cues in parallel and builds an FFmpeg concat manifest.
     Returns: (concat_txt_path, box_x, box_y, box_w, box_h)
@@ -203,17 +223,34 @@ def build_subtitle_concat_sequence(
         if c.end_sec > c.start_sec and c.start_sec < video_duration
     ]
 
-    # Parallel PNG generation
-    def _render_task(item: Tuple[int, SubtitleCue]) -> Tuple[int, Path]:
+    effect = getattr(cfg, "effect", "none") or "none"
+    effect_sec = float(getattr(cfg, "effect_duration", 0.3) or 0.3)
+
+    # Parallel PNG generation (+ the animation frames of each cue when an effect is on)
+    def _render_task(item: Tuple[int, SubtitleCue]) -> Tuple[int, Path, List[Path], List[Path], float]:
         idx, cue = item
         out_p = work_dir / f"cue_{idx:05d}.png"
-        render_single_subtitle_png(cue.text, cfg, box_w, box_h, out_p, scale_factor=scale_factor)
-        return idx, out_p
+        img = render_subtitle_image(cue.text, cfg, box_w, box_h, scale_factor)
+        img.save(out_p, format="PNG", compress_level=1)
+        n_in, n_out, step = subtitle_frame_counts(effect, effect_sec, max(0.0, cue.end_sec - cue.start_sec), fps)
+        intro: List[Path] = []
+        outro: List[Path] = []
+        for k, fr in enumerate(subtitle_intro_frames(img, effect, n_in)):
+            fp = work_dir / f"cue_{idx:05d}_i{k:02d}.png"
+            fr.save(fp, format="PNG", compress_level=1)
+            intro.append(fp)
+        for k, fr in enumerate(subtitle_outro_frames(img, effect, n_out)):
+            fp = work_dir / f"cue_{idx:05d}_o{k:02d}.png"
+            fr.save(fp, format="PNG", compress_level=1)
+            outro.append(fp)
+        return idx, out_p, intro, outro, step
 
     cue_paths: dict[int, Path] = {}
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        for idx, p in pool.map(_render_task, enumerate(valid_cues)):
+    cue_fx: dict[int, Tuple[List[Path], List[Path], float]] = {}
+    with ThreadPoolExecutor(max_workers=max(6, min(16, os.cpu_count() or 6))) as pool:
+        for idx, p, intro, outro, step in pool.map(_render_task, enumerate(valid_cues)):
             cue_paths[idx] = p
+            cue_fx[idx] = (intro, outro, step)
 
     def _fmt_file(p: Path) -> str:
         # FFmpeg concat demuxer safe forward-slash path escaping
@@ -230,8 +267,22 @@ def build_subtitle_concat_sequence(
         if start > cur_t + 0.005:
             manifest_lines.append(_fmt_file(blank_path))
             manifest_lines.append(f"duration {start - cur_t:.4f}")
+        intro, outro, step = cue_fx.get(idx, ([], [], 0.0))
+        span = end - start
+        # never let the animation frames overrun a (clipped / shortened) cue: drop outro first, then intro
+        while outro and (len(intro) + len(outro)) * step > span * 0.9:
+            outro = outro[:-1]
+        while intro and len(intro) * step > span * 0.9:
+            intro = intro[1:]
+        for fp in intro:
+            manifest_lines.append(_fmt_file(fp))
+            manifest_lines.append(f"duration {step:.4f}")
+        hold = span - (len(intro) + len(outro)) * step
         manifest_lines.append(_fmt_file(cue_paths[idx]))
-        manifest_lines.append(f"duration {end - start:.4f}")
+        manifest_lines.append(f"duration {hold:.4f}")
+        for fp in outro:
+            manifest_lines.append(_fmt_file(fp))
+            manifest_lines.append(f"duration {step:.4f}")
         cur_t = end
 
     if video_duration > cur_t + 0.01:
@@ -243,3 +294,47 @@ def build_subtitle_concat_sequence(
     concat_path = work_dir / "subs_concat.txt"
     concat_path.write_text("\n".join(manifest_lines), encoding="utf-8")
     return concat_path, box_x, box_y, box_w, box_h
+
+
+def build_channel_text_sequence(
+    cfg: Any,
+    video_w: int,
+    video_h: int,
+    fps: float,
+    work_dir: Path,
+) -> Tuple[List[str], int, int]:
+    """Channel name overlay input. Returns (ffmpeg input args, overlay x, overlay y).
+    Static -> one looped PNG; effect -> one period of animation frames in a concat file looped forever
+    (-stream_loop -1). Both are endless inputs: overlay them with shortest=1."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    bx = max(0, int(round(cfg.box.x * video_w)))
+    by = max(0, int(round(cfg.box.y * video_h)))
+    bw = max(16, min(video_w - bx, int(round(cfg.box.w * video_w))))
+    bh = max(16, min(video_h - by, int(round(cfg.box.h * video_h))))
+    bw, bh = bw - bw % 2, bh - bh % 2
+    img = render_subtitle_image(cfg.text or " ", cfg, bw, bh, video_h / 1080.0)
+    effect = getattr(cfg, "effect", "none") or "none"
+    mx, my = channel_margins(effect, bw, bh)
+    # keep the enlarged canvas inside the frame
+    mx = min(mx, bx, max(0, video_w - bx - bw))
+    my = min(my, by, max(0, video_h - by - bh))
+    mx, my = mx - mx % 2, my - my % 2
+    if mx or my:
+        canvas = Image.new("RGBA", (bw + 2 * mx, bh + 2 * my), (0, 0, 0, 0))
+        canvas.paste(img, (mx, my))
+        img = canvas
+    if effect == "none":
+        png = work_dir / "channel.png"
+        img.save(png, format="PNG", compress_level=1)
+        return ["-loop", "1", "-framerate", "5", "-i", str(png)], bx - mx, by - my
+
+    frames = channel_loop_frames(img, effect, fps, float(getattr(cfg, "effect_period_sec", 8.0) or 8.0))
+    lines = ["ffconcat version 1.0"]
+    for k, (fr, dur) in enumerate(frames):
+        fp = work_dir / f"channel_{k:04d}.png"
+        fr.save(fp, format="PNG", compress_level=1)
+        lines.append("file '" + str(fp.resolve()).replace("\\", "/").replace("'", "'\\''") + "'")
+        lines.append(f"duration {dur:.4f}")
+    txt = work_dir / "channel_loop.txt"
+    txt.write_text("\n".join(lines), encoding="utf-8")
+    return ["-stream_loop", "-1", "-f", "concat", "-safe", "0", "-i", str(txt)], bx - mx, by - my

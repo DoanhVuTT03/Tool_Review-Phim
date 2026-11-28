@@ -98,11 +98,54 @@ def already_running_mutex() -> bool:
         return False
 
 
+def code_mtime() -> float:
+    """Newest modification time of the server code (app/**/*.py)."""
+    newest = 0.0
+    for root, _dirs, files in os.walk(os.path.join(BASE_DIR, "app")):
+        for f in files:
+            if f.endswith(".py"):
+                try:
+                    newest = max(newest, os.path.getmtime(os.path.join(root, f)))
+                except OSError:
+                    pass
+    return newest
+
+
+def replace_outdated_server() -> bool:
+    """A running server keeps the code it was started with: double-clicking run.bat only opened another window,
+    so code updates (bug fixes) were silently not applied. If the server is idle and older than the code on
+    disk, ask it to shut down and return True (the caller then starts a fresh one)."""
+    import json
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{URL}/api/system/info", timeout=3) as r:
+            info = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return False  # very old server without /api/system/info, or not responding
+    if info.get("busy") or float(info.get("started") or 0) >= code_mtime():
+        return False
+    try:
+        req = urllib.request.Request(f"{URL}/api/system/shutdown", data=b"", method="POST")
+        urllib.request.urlopen(req, timeout=3).read()
+    except Exception:
+        return False
+    for _ in range(60):  # up to 30 s for the old server to release the port
+        if not port_open():
+            time.sleep(1.0)  # let the old process exit (it owns the single-instance mutex)
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def main() -> None:
     if already_running_mutex() or port_open():
-        log("tool already running -> opening another UI window")
-        wait_then_open_ui()
-        return
+        if port_open() and replace_outdated_server():
+            log("server ran older code than on disk and was idle -> restarted it")
+        else:
+            log("tool already running -> opening another UI window")
+            wait_then_open_ui()
+            return
 
     import uvicorn
     from app import main as app_main
@@ -129,8 +172,19 @@ def main() -> None:
                 log("UI never connected -> shutting down")
                 server.should_exit = True
 
+    def shutdown_watch() -> None:
+        while not server.should_exit:
+            time.sleep(0.5)
+            try:
+                if app_main.shutdown_requested():
+                    log("shutdown requested by a newer launch (code updated)")
+                    server.should_exit = True
+            except Exception:
+                pass
+
     threading.Thread(target=wait_then_open_ui, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
+    threading.Thread(target=shutdown_watch, daemon=True).start()
     log(f"starting server on {URL}")
     server.run()
     log("server stopped")

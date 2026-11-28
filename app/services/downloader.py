@@ -1,9 +1,12 @@
 from __future__ import annotations
 import asyncio
+import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -38,6 +41,35 @@ _SPAM_KEYWORDS = (
     "后期制作",
     "关注不迷路",
 )
+
+
+# Video format: <= 1080p (vertical 1080x1920 included), direct HTTPS (DASH) streams, codecs that decode fast:
+#  1. VP9 (YouTube 248: 3.0 GB for an 8 h video, CPU decode+crop 1314 fps)
+#  2. H.264 (YouTube 137: 4.7 GB, 1598 fps)
+#  AV1 only as a late fallback (399: 2.1 GB but 285 fps CPU decode -> it would throttle AI Clean Sub's ROI
+#  reader), and not the HLS "Premium" stream the old "bestvideo[ext=mp4]" picked (616: 7.1 GB, 5 693 fragments).
+# Audio: AAC m4a without DRC. Then progressively looser fallbacks (BiliBili / other sites).
+_RES = "[height<=1920][width<=1920]"
+_AUD = "ba[ext=m4a][format_id!*=drc]/ba[ext=m4a]/ba"
+_FORMAT_PREFERENCE = "/".join([
+    f"bv{_RES}[vcodec^=vp9][protocol^=http]+({_AUD})",
+    f"bv{_RES}[vcodec^=avc1][protocol^=http]+({_AUD})",
+    f"bv{_RES}[vcodec!^=av01][protocol^=http]+({_AUD})",
+    f"bv{_RES}[vcodec!^=av01]+({_AUD})",
+    f"bv{_RES}+({_AUD})",
+    f"b{_RES}",
+    "bv*+ba/b",
+])
+
+
+def _fmt_dur(sec: Any) -> str:
+    try:
+        sec = int(round(float(sec)))
+    except (TypeError, ValueError):
+        return "?"
+    h, rem = divmod(max(0, sec), 3600)
+    m, s_ = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s_:02d}" if h else f"{m:02d}:{s_:02d}"
 
 
 def _safe_filename(name: str) -> str:
@@ -145,6 +177,43 @@ def clean_srt_rules_sync(srt_path: str, out_path: Optional[str] = None) -> Tuple
     }
 
 
+# Lines per request in "automatic" mode: ~1 500 Chinese lines took ~2 min in one Antigravity conversation
+# (Gemini 4 Neon); requests run in parallel, so an 8 h movie (10 940 lines) = 8 requests, 2 rounds of 6.
+# Size is no longer capped by the 32 K command line: big inputs go to the agent as a file it reads itself
+# (translator._call_agentapi), and with a Gemini API key they are a plain HTTPS request.
+_AUTO_BATCH_LINES = 1500
+
+_CLEAN_SYSTEM_PROMPT = (
+    "Bạn là chuyên gia biên tập và làm sạch file phụ đề SRT gốc (KHÔNG DỊCH SANG NGÔN NGỮ KHÁC).\n"
+    "Đầu vào: mỗi dòng có dạng '<số>|||<nội dung>'.\n"
+    "Nhiệm vụ:\n"
+    "1. GIỮ NGUYÊN ngôn ngữ gốc của phụ đề.\n"
+    "2. Dòng rác hoàn toàn (quảng cáo kênh, kêu gọi like/sub/đăng ký, credit team sub, tên website, âm thanh "
+    "[Nhạc]/[Vỗ tay], ký tự nhận dạng giọng nói vô nghĩa): trả về '<số>|||DELETE'.\n"
+    "3. Dòng thoại có lỗi chính tả ASR/OCR hoặc ký tự thừa: trả về '<số>|||<nội dung đã sửa>' (giữ nguyên ý).\n"
+    "4. Dòng thoại đã đúng: KHÔNG trả về gì cho dòng đó (chỉ liệt kê các dòng cần xóa hoặc cần sửa).\n"
+    "5. TUYỆT ĐỐI chỉ trả về các dòng đúng định dạng '<số>|||<nội dung đã sửa hoặc DELETE>', không giải thích, "
+    "không markdown. Nếu không có dòng nào cần xóa/sửa, trả về đúng chữ: NONE"
+)
+
+
+def _pack_batches(cues: List[SubtitleCue], batch_lines: int, char_budget: int) -> List[List[SubtitleCue]]:
+    """Fills each request up to `batch_lines` lines (0 = no line limit) AND the prompt char budget."""
+    batches: List[List[SubtitleCue]] = []
+    cur: List[SubtitleCue] = []
+    size = 0
+    for c in cues:
+        ln = len(f"{c.index}|||{c.text}") + 1
+        if cur and ((batch_lines and len(cur) >= batch_lines) or size + ln > char_budget):
+            batches.append(cur)
+            cur, size = [], 0
+        cur.append(c)
+        size += ln
+    if cur:
+        batches.append(cur)
+    return batches
+
+
 async def clean_srt_with_antigravity(
     srt_path: str,
     model: str = "gemini-3.8-flash",
@@ -152,9 +221,17 @@ async def clean_srt_with_antigravity(
     api_key: str = "",
     on_progress: Optional[ProgressCallback] = None,
     llm_caller=invoke_llm,
+    concurrency: int = 6,
+    cancel: Optional[threading.Event] = None,
+    batch_lines: int = 0,
 ) -> Tuple[Path, Dict[str, Any]]:
-    """Uses selected Antigravity model to remove spam/watermark/ASR garbage lines & fix typos in original SRT
-    WITHOUT translating or altering timestamps."""
+    """Uses the selected Antigravity model to remove spam/watermark/ASR garbage lines & fix typos in the original
+    SRT WITHOUT translating or altering timestamps.
+
+    Few, big requests: the model answers ONLY the lines to delete or fix (unchanged lines are omitted), so the
+    answer stays short however many lines are sent. Lines per request = `batch_lines` (0 = automatic: as many as
+    fit in one prompt -> ~1 000 Chinese lines via agentapi, the whole file with a Gemini API key). The old way
+    echoed every line back in 80-line batches: 137 sequential requests (~50 min) for an 8 h movie."""
     cues = parse_srt(srt_path)
     if not cues:
         return Path(srt_path), {"before_count": 0, "after_count": 0, "removed_count": 0}
@@ -165,49 +242,76 @@ async def clean_srt_with_antigravity(
         thinking_level=thinking_level,  # type: ignore[arg-type]
         api_key=api_key,
     )
-    system_prompt = (
-        "Bạn là chuyên gia biên tập và làm sạch file phụ đề SRT gốc (KHÔNG DỊCH SANG NGÔN NGỮ KHÁC).\n"
-        "Nhiệm vụ:\n"
-        "1. GIỮ NGUYÊN ngôn ngữ gốc của phụ đề.\n"
-        "2. Với các dòng rác hoàn toàn (quảng cáo kênh, kêu gọi like/sub/đăng ký, credit team sub, tên website, âm thanh [Nhạc]/[Vỗ tay], ký tự nhận dạng giọng nói vô nghĩa): trả về '<số>|||DELETE'.\n"
-        "3. Với các dòng lời thoại hợp lệ: giữ nguyên ý, sửa nhẹ lỗi chính tả ASR/OCR hoặc bỏ ký tự thừa nếu có, trả về '<số>|||<nội dung đã làm sạch>'.\n"
-        "4. TUYỆT ĐỐI chỉ trả về đúng định dạng '<số>|||<nội dung hoặc DELETE>' cho mỗi dòng, không giải thích, không markdown."
-    )
+    for c in cues:
+        c.text = c.text.replace("\r", " ").replace("\n", " ")
+    per_request = int(batch_lines or 0) if int(batch_lines or 0) > 0 else _AUTO_BATCH_LINES
+    batches = _pack_batches(cues, per_request, 10**12)
+    split_note = ""
+    edits: Dict[int, str] = {}
 
-    batch_size = 80
-    batches = [cues[i : i + batch_size] for i in range(0, len(cues), batch_size)]
-    cleaned_map: Dict[int, str] = {}
+    sem = asyncio.Semaphore(max(1, concurrency))
+    done = [0]
+    t0 = time.time()
 
-    for b_idx, batch in enumerate(batches, start=1):
-        if on_progress:
-            pct = round(10.0 + ((b_idx - 1) / max(1, len(batches))) * 85.0, 1)
-            on_progress(pct, f"Antigravity ({model}) đang dọn rác SRT lô {b_idx}/{len(batches)}...")
-        block = "\n".join(f"{c.index}|||{c.text.replace(chr(10), ' ')}" for c in batch)
-        user_prompt = f"[TEXT_START]\n{block}\n[TEXT_END]"
-        raw = await llm_caller(cfg, system_prompt, user_prompt)
-        parsed = parse_translated_lines(raw)
-        for c in batch:
-            cleaned_map[c.index] = parsed.get(c.index, c.text)
+    async def _one(batch: List[SubtitleCue]) -> None:
+        async with sem:
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("Đã dừng theo yêu cầu.")
+            block = "\n".join(f"{c.index}|||{c.text}" for c in batch)
+            raw = await llm_caller(cfg, _CLEAN_SYSTEM_PROMPT, f"[TEXT_START]\n{block}\n[TEXT_END]")
+            valid = {c.index for c in batch}
+            for idx, txt in parse_translated_lines(raw).items():
+                if idx in valid:
+                    edits[idx] = txt
+            done[0] += 1
+            if on_progress:
+                el = time.time() - t0
+                eta = el / done[0] * (len(batches) - done[0])
+                on_progress(
+                    round(10.0 + done[0] / len(batches) * 85.0, 1),
+                    f"Antigravity ({model}) dọn rác SRT: xong {done[0]}/{len(batches)} lần gửi"
+                    f" · đã chạy {_fmt_dur(el)}" + (f" · còn ~{_fmt_dur(eta)}" if done[0] < len(batches) else ""),
+                )
+
+    if on_progress:
+        per = -(-len(cues) // len(batches))
+        on_progress(
+            10.0,
+            f"Antigravity ({model}) dọn rác SRT: {len(cues)} dòng → {len(batches)} lần gửi (~{per} dòng/lần, "
+            f"{min(concurrency, len(batches))} lần song song){split_note}...",
+        )
+    await asyncio.gather(*(_one(b) for b in batches))
 
     out_cues: List[SubtitleCue] = []
-    removed = 0
+    removed = fixed = 0
     for c in cues:
-        val = cleaned_map.get(c.index, c.text).strip()
-        if not val or val.upper() == "DELETE":
+        val = edits.get(c.index)
+        if val is not None and val.strip().upper() == "DELETE":
             removed += 1
             continue
-        out_cues.append(
-            SubtitleCue(index=len(out_cues) + 1, start_sec=c.start_sec, end_sec=c.end_sec, text=val)
-        )
+        if val is not None and val.strip() and val.strip() != c.text.strip():
+            fixed += 1
+            text = val.strip()
+        else:
+            text = c.text
+        out_cues.append(SubtitleCue(index=len(out_cues) + 1, start_sec=c.start_sec, end_sec=c.end_sec, text=text))
 
-    out_path = Path(srt_path).with_name(f"{Path(srt_path).stem}_clean.srt")
+    stem = Path(srt_path).stem
+    stem = stem[: -len("_clean")] if stem.endswith("_clean") else stem  # no "<name>_clean_clean.srt"
+    out_path = Path(srt_path).with_name(f"{stem}_clean.srt")
     write_srt(out_cues, str(out_path))
     if on_progress:
-        on_progress(100.0, f"AI đã dọn sạch {removed} dòng rác! Còn {len(out_cues)}/{len(cues)} dòng chuẩn.")
+        on_progress(
+            100.0,
+            f"AI đã dọn {removed} dòng rác, sửa {fixed} dòng ({len(batches)} lần gửi, {_fmt_dur(time.time() - t0)}). "
+            f"Còn {len(out_cues)}/{len(cues)} dòng.",
+        )
     return out_path, {
         "before_count": len(cues),
         "after_count": len(out_cues),
         "removed_count": removed,
+        "fixed_count": fixed,
+        "requests": len(batches),
         "path": str(out_path),
     }
 
@@ -249,6 +353,7 @@ def _match_sub_lang_candidates(preferred: str, available_keys: List[str]) -> Lis
 def _download_sync(
     req: DownloadVideoRequest,
     on_progress: Optional[ProgressCallback] = None,
+    cancel: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
     """High-speed multi-threaded YouTube/BiliBili downloader using yt-dlp + aria2c + concurrent fragments."""
     import yt_dlp  # type: ignore
@@ -272,6 +377,7 @@ def _download_sync(
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        "format": _FORMAT_PREFERENCE,  # so info["requested_formats"] = what will really be downloaded (sizes)
     }
     if req.browser_cookies != "none":
         probe_opts["cookiesfrombrowser"] = (req.browser_cookies,)
@@ -323,48 +429,101 @@ def _download_sync(
         if chosen_lang
         else "Video không có phụ đề rời đi kèm"
     )
+    is_youtube = str(info.get("extractor_key") or info.get("extractor") or "").lower().startswith("youtube")
+    # aria2c only off YouTube: YouTube throttles every extra connection (measured on a ~100 Mbps line, format
+    # 137: yt-dlp's own chunked downloader 12 MB/s = the line's cap; aria2c x16 3.8 MB/s, x1 0.34 MB/s, and the
+    # last pieces crawled at ~10 KB/s for minutes). BiliBili's CDN still benefits from parallel connections.
+    use_aria2 = bool(aria2_path) and not is_youtube
+    t_start = time.time()
+
+    def _elapsed() -> str:
+        return _fmt_dur(time.time() - t_start)
+
     if on_progress:
-        on_progress(12.0, f"Đang tải tốc độ cao ({threads} luồng{' + aria2c' if aria2_path else ''}) | {sub_note}...")
+        how = f"aria2c {aria_conn} kết nối" if use_aria2 else "tải trực tiếp, tối đa băng thông"
+        on_progress(8.0, f"Bắt đầu tải ({how}) | {sub_note}")
+
+    # Per-stream byte counters -> one overall percentage for video + audio (+ subtitle).
+    streams: Dict[str, Dict[str, Any]] = {}
+    planned = {
+        str(f.get("format_id")): float(f.get("filesize") or f.get("filesize_approx") or 0)
+        for f in (info.get("requested_formats") or [])
+    }
+
+    def _check_cancel() -> None:
+        if cancel is not None and cancel.is_set():
+            raise yt_dlp.utils.DownloadCancelled("Đã dừng tải theo yêu cầu.")
 
     def _hook(d: Dict[str, Any]):
+        _check_cancel()
         if not on_progress:
             return
         st = d.get("status")
+        inf = d.get("info_dict") or {}
+        fid = str(inf.get("format_id") or d.get("filename") or "?")
+        vc, ac = str(inf.get("vcodec") or ""), str(inf.get("acodec") or "")
+        if inf.get("ext") in ("vtt", "srt", "json3", "ass", "srv3") or (vc == "none" and ac == "none"):
+            kind = "phụ đề"
+        else:
+            kind = "hình" if vc not in ("", "none") else "tiếng"
+        total = float(d.get("total_bytes") or d.get("total_bytes_estimate") or planned.get(fid) or 0)
+        rec = streams.setdefault(fid, {"done": 0.0, "total": total, "kind": kind})
+        rec["total"] = max(rec["total"], total)
         if st == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            down = d.get("downloaded_bytes") or 0
-            spd = strip_ansi(d.get("_speed_str", "").strip())
-            eta = strip_ansi(d.get("_eta_str", "").strip())
-            pct = 12.0 + (down / total) * 72.0 if total > 0 else 40.0
-            on_progress(round(min(84.0, pct), 1), f"Đang tải ({threads} luồng): {spd} • Còn {eta}")
+            rec["done"] = float(d.get("downloaded_bytes") or 0)
         elif st == "finished":
-            on_progress(86.0, "Tải xong luồng dữ liệu, đang ghép Video + Audio + Phụ đề...")
+            rec["done"] = max(rec["done"], rec["total"], float(d.get("downloaded_bytes") or d.get("total_bytes") or 0))
+        all_total = sum(max(v["total"], planned.get(k, 0.0)) for k, v in streams.items())
+        all_total += sum(sz for k, sz in planned.items() if k not in streams)
+        all_done = sum(v["done"] for v in streams.values())
+        pct = 8.0 + 77.0 * (all_done / all_total) if all_total > 0 else 30.0
+        media = list(planned) or list(streams)
+        idx = (media.index(fid) + 1) if fid in media else len(streams)
+        n = max(1, len(media))
+        if st == "downloading":
+            spd = float(d.get("speed") or 0)
+            eta = d.get("eta")
+            msg = (
+                f"Đang tải {kind} ({idx}/{n}): {all_done / 1e6:,.0f} / {all_total / 1e6:,.0f} MB · {spd / 1e6:.1f} MB/s"
+                + (f" · còn {_fmt_dur(eta)}" if eta else "")
+                + f" · đã chạy {_elapsed()}"
+            )
+            on_progress(round(min(85.0, pct), 1), msg)
+        elif st == "finished":
+            nxt = "chuyển sang phần tiếp theo" if idx < n else "chuẩn bị ghép"
+            on_progress(round(min(85.0, pct), 1), f"Tải xong {kind} ({idx}/{n}), {nxt}... · đã chạy {_elapsed()}")
+
+    def _pp_hook(d: Dict[str, Any]):
+        _check_cancel()
+        if not on_progress or d.get("status") != "started":
+            return
+        pp = str(d.get("postprocessor") or "")
+        if pp == "Merger":
+            on_progress(86.0, f"Đang ghép hình + tiếng thành 1 file MP4 (không nén lại)... · đã chạy {_elapsed()}")
+        elif "Subtitle" in pp:
+            on_progress(88.0, f"Đang chuyển phụ đề sang SRT... · đã chạy {_elapsed()}")
 
     dl_opts: Dict[str, Any] = {
         "outtmpl": str(out_dir / f"{safe_stem}.%(ext)s"),
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "format": _FORMAT_PREFERENCE,
         "merge_output_format": "mp4",
         "ffmpeg_location": ffmpeg_dir,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "concurrent_fragment_downloads": threads,
+        "noprogress": True,  # the console progress bar flooded data/logs/server.log
+        "concurrent_fragment_downloads": threads,  # HLS / DASH-fragment sites (BiliBili, m3u8 fallbacks)
         "retries": 10,
         "fragment_retries": 10,
         "progress_hooks": [_hook],
+        "postprocessor_hooks": [_pp_hook],
     }
 
-    if aria2_path:
+    if use_aria2:
         dl_opts["external_downloader"] = {"default": aria2_path}
         # yt-dlp Aria2cFD defaults to -x16 -j16 -s16. If threads < 16, downscale; otherwise keep standard 16.
         if threads < 16:
-            dl_opts["external_downloader_args"] = {
-                "aria2c": [
-                    f"-x{threads}",
-                    f"-s{threads}",
-                    f"-j{threads}",
-                ]
-            }
+            dl_opts["external_downloader_args"] = {"aria2c": [f"-x{threads}", f"-s{threads}", f"-j{threads}"]}
 
     if req.browser_cookies != "none":
         dl_opts["cookiesfrombrowser"] = (req.browser_cookies,)
@@ -379,15 +538,18 @@ def _download_sync(
     try:
         with yt_dlp.YoutubeDL(dl_opts) as ydl:
             ydl.download([url])
+    except yt_dlp.utils.DownloadCancelled as ex:
+        raise RuntimeError("Đã dừng tải theo yêu cầu.") from ex
     except Exception as ex:
-        # If external downloader / aria2c failed for ANY reason, auto-fallback to native yt-dlp multi-fragment downloader
-        if aria2_path:
+        if cancel is not None and cancel.is_set():
+            raise RuntimeError("Đã dừng tải theo yêu cầu.") from ex
+        # aria2c failed for any reason -> retry with yt-dlp's own multi-fragment downloader
+        if use_aria2:
             if on_progress:
                 on_progress(45.0, f"Đang tự động chuyển sang tải đa luồng nội bộ ({threads} luồng)...")
             fb_opts = dict(dl_opts)
             fb_opts.pop("external_downloader", None)
             fb_opts.pop("external_downloader_args", None)
-            fb_opts["concurrent_fragment_downloads"] = threads
             try:
                 with yt_dlp.YoutubeDL(fb_opts) as ydl_fb:
                     ydl_fb.download([url])
@@ -437,23 +599,26 @@ def _download_sync(
         "srt_path": srt_path,
         "title": safe_stem,
         "subtitle_source": sub_note,
-        "used_aria2c": bool(aria2_path),
+        "used_aria2c": use_aria2,
         "threads": threads,
+        "download_sec": round(time.time() - t_start, 1),
     }
 
 
 async def download_and_clean_video(
     req: DownloadVideoRequest,
     on_progress: Optional[ProgressCallback] = None,
+    cancel: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
-    res = await asyncio.to_thread(_download_sync, req, on_progress)
+    t0 = time.time()
+    res = await asyncio.to_thread(_download_sync, req, on_progress, cancel)
     srt_path = res.get("srt_path", "")
     clean_stats: Dict[str, Any] = {}
 
     if srt_path and Path(srt_path).exists():
         if req.clean_srt_rules:
             if on_progress:
-                on_progress(90.0, "Đang lọc rác SRT cơ bản (thẻ HTML, dòng trùng, [Nhạc])...")
+                on_progress(90.0, "Đang lọc rác phụ đề gốc (thẻ HTML, dòng trùng, [Nhạc]) — không phải xóa sub trên hình...")
             _, clean_stats = await asyncio.to_thread(clean_srt_rules_sync, srt_path)
 
         if req.clean_srt_ai:
@@ -464,12 +629,15 @@ async def download_and_clean_video(
                 model=req.clean_model,
                 thinking_level=req.clean_thinking_level,
                 api_key=req.api_key,
-                on_progress=lambda p, m: on_progress(round(92.0 + p * 0.08, 1), m) if on_progress else None,
+                on_progress=lambda p, m: on_progress(round(92.0 + p * 0.07, 1), m) if on_progress else None,
+                cancel=cancel,
+                batch_lines=req.clean_batch_lines,
             )
             res["srt_path"] = str(cleaned_p)
             clean_stats["ai_clean"] = ai_stats
 
     res["clean_stats"] = clean_stats
+    res["total_sec"] = round(time.time() - t0, 1)
     if on_progress:
-        on_progress(100.0, f"Tải hoàn tất: {Path(res['video_path']).name}")
+        on_progress(99.0, f"Tải hoàn tất: {Path(res['video_path']).name} · tổng {_fmt_dur(res['total_sec'])}")
     return res
