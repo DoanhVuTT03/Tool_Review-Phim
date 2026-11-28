@@ -51,6 +51,7 @@ SELECTORS: Dict[str, List[str]] = {
     ],
     # the chip of an attached file in the prompt box
     "attachment": [
+        "gem-attachment",  # verified on gemini.google.com 28/11/2026
         "uploader-file-preview",
         "uploader-file-preview-container",
         "[data-test-id='file-preview']",

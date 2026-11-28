@@ -125,6 +125,30 @@ async function init() {
   window.addEventListener("resize", fitStageCanvas);
   setInterval(renderJobTimer, 500); // live stopwatch of the selected video
   initGeminiWeb();
+  watchCodeUpdates();
+}
+
+// The page is read from disk on every load, the Python server is not: after a code update the UI looks new while
+// the old code still runs (style guide sent the old way). Tell the user to restart the tool.
+function watchCodeUpdates() {
+  let warned = false;
+  const check = async () => {
+    if (warned) return;
+    try {
+      const r = await api("/api/system/code-status");
+      if (r.stale) {
+        warned = true;
+        showToast(
+          "⚠ Code của tool vừa được cập nhật nhưng tool vẫn đang chạy bản cũ. Hãy bấm Dừng (nếu đang chạy), " +
+            "TẮT HẲN tool rồi mở lại để dùng bản mới. File đổi: " + r.changed.join(", "),
+          "warn",
+          600000
+        );
+      }
+    } catch {}
+  };
+  check();
+  setInterval(check, 30000);
 }
 
 async function loadHardware() {

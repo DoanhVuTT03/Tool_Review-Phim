@@ -135,6 +135,24 @@ async def system_heartbeat():
     return {"ok": True, "busy": has_running_jobs()}
 
 
+_SERVER_STARTED = time.time()
+_CODE_ROOT = Path(__file__).resolve().parent
+
+
+@app.get("/api/system/code-status")
+async def system_code_status():
+    """stale = a .py file changed after this server started: the UI (read from disk on every load) is already
+    new but the running Python code is still the old one -> the user must close and reopen the tool."""
+    changed = []
+    for f in list(_CODE_ROOT.rglob("*.py")) + [_CODE_ROOT.parent / "launcher.pyw"]:
+        try:
+            if f.stat().st_mtime > _SERVER_STARTED + 1:
+                changed.append(str(f.relative_to(_CODE_ROOT.parent)))
+        except OSError:
+            pass
+    return {"stale": bool(changed), "changed": changed[:10], "started": _SERVER_STARTED}
+
+
 @app.get("/api/system/info")
 async def system_info():
     return {"started": _SERVER_STARTED, "busy": has_running_jobs(), "pid": os.getpid()}
